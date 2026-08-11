@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import signal
 import io
+import ctypes
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,10 @@ def child(code):
 
 
 def pid_is_gone(pid):
+    if os.name == "nt":
+        return windows_pid_is_gone(pid)
+    if os.name != "posix":
+        raise RuntimeError(f"unsupported process probe platform: {os.name}")
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -36,6 +41,60 @@ def pid_is_gone(pid):
     except PermissionError:
         return False
     return False
+
+
+def windows_pid_is_gone(pid):
+    """Check a Windows PID without calling os.kill (which terminates processes)."""
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    error_invalid_parameter = 87
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == error_invalid_parameter
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value != still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+class WindowsPidProbeTests(unittest.TestCase):
+    def test_windows_pid_probe_never_calls_os_kill(self):
+        with mock.patch.object(os, "name", "nt"), \
+             mock.patch.object(sys.modules[__name__], "windows_pid_is_gone", return_value=True), \
+             mock.patch.object(os, "kill") as kill:
+            self.assertTrue(pid_is_gone(456))
+
+        kill.assert_not_called()
+
+    def test_windows_probe_queries_exit_code_and_closes_handle(self):
+        kernel32 = mock.Mock()
+        kernel32.OpenProcess.return_value = 123
+        kernel32.CloseHandle.return_value = True
+
+        def get_exit_code(_handle, exit_code):
+            exit_code._obj.value = 259  # STILL_ACTIVE
+            return True
+
+        kernel32.GetExitCodeProcess.side_effect = get_exit_code
+        with mock.patch.object(ctypes, "WinDLL", return_value=kernel32, create=True):
+            self.assertFalse(windows_pid_is_gone(456))
+
+        kernel32.OpenProcess.assert_called_once()
+        kernel32.GetExitCodeProcess.assert_called_once()
+        kernel32.CloseHandle.assert_called_once_with(123)
 
 
 class TimeoutRunnerTests(unittest.TestCase):
