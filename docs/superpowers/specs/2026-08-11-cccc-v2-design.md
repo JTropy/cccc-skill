@@ -114,11 +114,15 @@ repo lock 使用同文件系统的唯一 ownership inode 与 no-clobber hard lin
 
 `consult.sh <claude|codex> <discussion-card> [workdir]` 使用相同的路径、临时文件和运行新鲜度机制。
 
-Claude 顾问采用 `--safe-mode`、`--tools Read,Glob,Grep`、`--permission-mode dontAsk`、`--disable-slash-commands` 和 `--no-session-persistence`，避免加载项目 hooks、plugins、MCP 与写执行工具。
+Claude 顾问采用 `--safe-mode`、`--tools Read,Glob,Grep`、`--permission-mode dontAsk`、`--disable-slash-commands`、`--no-session-persistence` 与 `--no-chrome`。再配合空 MCP 配置和 strict MCP 校验作纵深防御，使普通项目 CLAUDE.md、skills、plugins、hooks、MCP、commands 与 agents 不进入本轮；管理员强制设置、认证/API 请求和进程本身仍不属于 OS 级只读隔离。
 
-Codex 顾问默认采用 `--ephemeral --sandbox read-only --ignore-user-config --ignore-rules`，保留 CLI 认证但不加载用户规则、MCP 与自定义 provider，形成严格模式。依赖 custom provider 的用户可显式设置 `CCCC_CODEX_CONFIG_MODE=inherit`；此时仍有文件系统只读沙箱，但 wrapper 必须警告第三方 MCP/connector 可能具有外部副作用，不能再宣称完整只读。
+Codex 顾问默认使用 `strict` 配置模式：从本轮 `0700` 私有空目录启动，以绝对路径在 prompt 中指向仓库与 discussion card，并通过 `--add-dir` 只把仓库加入 read-only 会话；不得以仓库作为 cwd。调用保留 `--ephemeral --sandbox read-only --ignore-user-config --ignore-rules --skip-git-repo-check`，同时固定官方 `openai` provider，关闭 project docs、bundled skill instructions、hooks、plugins、apps、browser/computer-use、memories、multi-agent、image generation、workspace dependency/skill discovery、shell snapshot 等可扩展工具面。wrapper 必须预检当前 CLI 支持全部安全参数和 feature 名；缺一项即 fail closed，不静默降级。该模式隔离普通用户与项目配置，但管理员/managed policy 仍可生效，因此只称“受限工具面并经 Git 审计的只读第二意见”，不称 OS 级隔离。
 
-consult 默认要求 clean worktree；显式使用 dirty 逃生口时，wrapper 对所有 Git tracked 与非 ignored untracked 路径做内容指纹快照，并警告 Git metadata 与 ignored 路径不在审计边界内。顾问运行前后 HEAD 或该快照出现任何变化都视为只读策略失守。观点与日志都带 target 后缀，使同一议题可分别咨询两端。文档统一使用“只读第二意见”，不承诺双方一定形成共识。
+依赖 custom provider 的用户可显式设置 `CCCC_CODEX_CONFIG_MODE=inherit`。inherit 仍从私有空 cwd 启动、使用 read-only sandbox 并关闭项目发现，但继承用户 provider/config；wrapper 必须明确警告第三方 MCP、connector、plugin、hook 或 provider 可能产生仓库外副作用，不能称 strict。空 `mcp_servers={}` 不是清空已合并 MCP 配置的安全机制，不作为隔离手段。
+
+consult 与 delegate 复用同一 physical Git common-dir repo-wide ownership lock，在 baseline/CLI 前取得并持有到 opinion 最终发布；不同 target、不同 discussion card、两个 linked worktree 也不得并发。discussion card 及祖先、输出 parent identity、可信 timeout status、signal/descendant 清理、no-clobber 发布与半发布孤儿日志语义全部沿用 delegate 的安全原语，不再使用 per-topic mkdir claim。
+
+consult 默认要求 clean worktree；显式使用 dirty 逃生口时，wrapper 对所有 Git tracked 与非 ignored untracked 路径做内容指纹快照，并警告 Git metadata 与 ignored 路径不在审计边界内。顾问运行前后 HEAD、card/ancestor identity 或该快照出现任何变化都视为只读策略失守。观点与日志都带 target 后缀，使同一议题可分别咨询两端；第一轮产物会使第二轮默认遇到 dirty worktree，调用者须先归档/提交，或显式使用 dirty escape 并接受警告。文档统一使用“只读第二意见”，不承诺双方一定形成共识。
 
 ## 超时与进程清理
 
