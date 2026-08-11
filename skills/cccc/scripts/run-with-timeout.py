@@ -733,6 +733,7 @@ def launch_windows_bootstrap(command):
     if transport is None:
         bootstrap_command = [
             sys.executable,
+            "-I",
             os.path.abspath(__file__),
             "--windows-bootstrap",
             gate.name,
@@ -743,6 +744,7 @@ def launch_windows_bootstrap(command):
     else:
         bootstrap_command = [
             sys.executable,
+            "-I",
             os.path.abspath(__file__),
             "--windows-bootstrap",
             gate.name,

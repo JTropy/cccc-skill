@@ -688,6 +688,9 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         def launch(arguments, **options):
             events.append("popen")
             self.assertEqual(options["creationflags"], 0x00000200)
+            self.assertEqual(
+                arguments[:3], [sys.executable, "-I", str(RUNNER.resolve())]
+            )
             self.assertEqual(arguments[-3:], ["--", "target", "argument"])
             return process
 
@@ -926,6 +929,7 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
                 arguments,
                 [
                     sys.executable,
+                    "-I",
                     str(RUNNER.resolve()),
                     "--windows-bootstrap",
                     gate.name,
