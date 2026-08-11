@@ -160,6 +160,47 @@ class ValidateSkillTests(unittest.TestCase):
                 )
                 self.assertIn("single-line string scalar", "\n".join(self.validate(skill_path)))
 
+    def test_ignores_skill_reference_inside_plain_yaml_comment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_path = self.make_skill(
+                Path(temp_dir),
+                openai_yaml=(
+                    "interface:\n"
+                    "  display_name: cccc\n"
+                    "  short_description: Route work\n"
+                    "  default_prompt: Route work # mention $cccc only in comment\n"
+                ),
+            )
+            self.assertIn("must contain $cccc", "\n".join(self.validate(skill_path)))
+
+    def test_rejects_other_non_string_plain_scalars(self) -> None:
+        invalid_values = (
+            "0x10",
+            "0o10",
+            "0b10",
+            ".inf",
+            ".NaN",
+            "- a-list-item",
+            "? a-mapping-key",
+            ": a-mapping-value",
+            "nested: mapping",
+        )
+        for value in invalid_values:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temp_dir:
+                skill_path = self.make_skill(
+                    Path(temp_dir),
+                    frontmatter=f"---\nname: cccc\ndescription: {value}\n---\n",
+                )
+                self.assertIn("single-line string scalar", "\n".join(self.validate(skill_path)))
+
+    def test_accepts_plain_scalar_with_literal_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_path = self.make_skill(
+                Path(temp_dir),
+                frontmatter="---\nname: cccc\ndescription: C# skill\n---\n",
+            )
+            self.assertEqual([], self.validate(skill_path))
+
     def test_accepts_nested_metadata_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skill_path = self.make_skill(
@@ -193,6 +234,20 @@ class ValidateSkillTests(unittest.TestCase):
             )
             (skill_path / "guide.md").write_text("# Guide\n", encoding="utf-8")
             (skill_path / "reference (v2).md").write_text("# Reference\n", encoding="utf-8")
+            self.assertEqual([], self.validate(skill_path))
+
+    def test_checks_local_markdown_destination_with_apostrophe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_path = self.make_skill(Path(temp_dir), body="[missing](missing's.md)\n")
+            self.assertIn("does not exist", "\n".join(self.validate(skill_path)))
+
+    def test_ignores_only_odd_backslash_escaped_markdown_openers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_path = self.make_skill(
+                Path(temp_dir),
+                body="\\[ignored](missing.md)\n\\\\[checked](checked.md)\n",
+            )
+            (skill_path / "checked.md").write_text("# Checked\n", encoding="utf-8")
             self.assertEqual([], self.validate(skill_path))
 
     def test_ignores_arbitrary_external_markdown_uri_schemes(self) -> None:

@@ -28,6 +28,8 @@ NON_STRING_SCALARS = {"~", "null", "true", "false", "yes", "no", "on", "off"}
 NUMERIC_SCALAR = re.compile(
     r"[-+]?(?:[0-9][0-9_]*)(?:\.[0-9_]*)?(?:[eE][-+]?[0-9_]+)?$"
 )
+BASE_NUMBER_SCALAR = re.compile(r"[-+]?0(?:x[0-9a-f_]+|o[0-7_]+|b[01_]+)$", re.IGNORECASE)
+SPECIAL_FLOAT_SCALAR = re.compile(r"[-+]?\.(?:inf|nan)$", re.IGNORECASE)
 REQUIRED_INTERFACE_FIELDS = ("display_name", "short_description", "default_prompt")
 
 
@@ -36,6 +38,14 @@ def _parse_scalar(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
+    return value
+
+
+def _strip_plain_scalar_comment(value: str) -> str:
+    """Remove a YAML comment marker only when whitespace precedes it."""
+    for index, character in enumerate(value):
+        if character == "#" and index > 0 and value[index - 1].isspace():
+            return value[:index].rstrip()
     return value
 
 
@@ -57,12 +67,19 @@ def _parse_string_scalar(value: str) -> str | None:
         if "'" in content.replace("''", ""):
             return None
         return content.replace("''", "'")
+    value = _strip_plain_scalar_comment(value)
+    if not value:
+        return ""
     if value.endswith(("'", '"')):
         return None
     if (
-        value[0] in "|>[{&*!"
+        value[0] in "|>[{&*!,"
+        or (value[0] in "-?:" and (len(value) == 1 or value[1].isspace()))
+        or ": " in value
         or value.lower() in NON_STRING_SCALARS
         or NUMERIC_SCALAR.fullmatch(value) is not None
+        or BASE_NUMBER_SCALAR.fullmatch(value) is not None
+        or SPECIAL_FLOAT_SCALAR.fullmatch(value) is not None
     ):
         return None
     return value
@@ -137,6 +154,14 @@ def _markdown_destinations(text: str) -> list[str]:
         opening_index = text.find("[", index)
         if opening_index == -1:
             return destinations
+        backslashes = 0
+        for backslash_index in range(opening_index - 1, -1, -1):
+            if text[backslash_index] != "\\":
+                break
+            backslashes += 1
+        if backslashes % 2 == 1:
+            index = opening_index + 1
+            continue
         label_end = text.find("](", opening_index + 1)
         if label_end == -1:
             return destinations
@@ -157,7 +182,12 @@ def _markdown_destinations(text: str) -> list[str]:
                 if character == quoted:
                     quoted = None
                 continue
-            if character in {"'", '"'}:
+            if (
+                character in {"'", '"'}
+                and depth == 1
+                and closing_index > contents_start
+                and text[closing_index - 1].isspace()
+            ):
                 quoted = character
             elif character == "(":
                 depth += 1
