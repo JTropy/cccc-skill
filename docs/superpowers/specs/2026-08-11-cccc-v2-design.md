@@ -87,9 +87,14 @@ package.json
 运行前：
 
 - 验证 CLI、Git 仓库、task card、正整数超时和 sandbox 档位；
+- 在任何 clean/baseline 检查或 child 启动前，取得覆盖同一 Git common-dir 的 repo-wide execution lock，并持有到最终 report 发布完成；不同卡片也不并发修改同一仓库；
 - 默认要求 clean worktree；`CCCC_ALLOW_DIRTY=1` 仅作为显式逃生口并打印强警告；
 - 记录 HEAD 与工作树快照；
 - 在目标目录中创建仅本轮可见的唯一临时产物，不复用旧 report/log/last-message。
+
+repo lock 使用同文件系统的唯一 ownership inode 与 no-clobber hard link 建立；EXIT 清理前必须重新证明 lock 与本轮 ownership inode 相同，不能因 signal/竞争误删另一进程的 lock。`GIT_DIR`、`GIT_WORK_TREE`、`GIT_INDEX_FILE`、`GIT_COMMON_DIR` 与 `GIT_OBJECT_DIRECTORY` 等可重定向审计对象的环境覆盖在 preflight 阶段拒绝。Python helper 用 isolated mode，Windows POSIX shim 子进程不继承 `BASH_ENV`/`ENV`。
+
+任务卡本身及其任何祖先目录都不能落入 allowed-path 范围。child 结束后重新验证 task card 的普通文件、物理路径和内容指纹；策略检查以 pre-run 解析结果为准。changed-path 消费保持 NUL-safe，诊断/日志用十六进制或等价转义，避免换行文件名伪造 metadata。
 
 权限档位：
 
@@ -101,7 +106,9 @@ package.json
 
 模型沿用各 CLI 当前配置；`CCCC_MODEL` 与 `CCCC_EFFORT` 允许调用者显式覆盖。脚本不再声称能判断“更强模型”，也不强制升级用户模型或预算。
 
-子代理最终回复直接作为结构化 report 捕获，由 wrapper 在确认是本轮新产物后先取得基于卡片 stem 的原子 claim，再把内容写入目标目录内的唯一临时文件，通过硬链接执行 no-clobber 原子发布；日志先发布，report/opinion 最后作为成功标记。目标或 claim 已存在、或平台不支持安全发布时失败，不退化成覆盖式 `mv`。wrapper 发现 HEAD 改变、缺少 report、策略外文件变化或 agent 非零退出时必须返回非零，不得把旧文件当成功回执。同一卡片并发运行只能有一个发布成功。
+子代理最终回复直接作为结构化 report 捕获。wrapper 确认本轮新产物、重新验证 card/card-parent identity 与输出空缺后，通过硬链接执行 no-clobber 原子发布；POSIX 发布固定到已验证 parent dirfd，Windows 至少拒绝 reparse parent 并在每个提交点前后复核 identity。日志先发布，report/opinion 最后作为唯一成功标记。目标或 repo lock 已存在、或平台不支持安全发布时失败，不退化成覆盖式 `mv`。若日志已发布而 report 提交失败，保留孤儿日志作为失败诊断并明确提示人工删除后重试；绝不把它当作成功。wrapper 发现 HEAD 改变、card/祖先变化、缺少 report、策略外文件变化或 agent 非零退出时必须返回非零，不得把旧文件当成功回执。同一仓库的 cccc 执行被序列化。
+
+失败优先级固定为：timeout/interruption cleanup failure `125` > HEAD/card/snapshot/path-policy violation `4` > 可信 runner timeout `124` > child nonzero `70`；`5` 仅用于 agent 启动前的输出/lock 冲突、空或不安全产物及发布阶段失败。所有组合仍在 stderr 记录原始 child outcome。
 
 ## consult 设计
 
@@ -122,6 +129,8 @@ consult 默认要求 clean worktree；显式使用 dirty 逃生口时，wrapper 
 - wrapper 在成功完成超时清理后返回 124，同时保留原始 `agent_rc` 与 wrapper 失败原因；
 - 124 只表示 deadline 已触发且子进程清理完成；若 signal/job/reap 清理失败则返回 125，避免把残留进程伪装成普通超时；
 - `CCCC_TIMEOUT=0` 才表示调用者明确接受不限时。
+
+helper 的可选私有 status file 由 runner 以 no-clobber 方式创建并写入 versioned outcome；它区分 child 自然 `2/124/125/127`、launch、timeout 与 cleanup，stderr marker 只作人类诊断，不再作为 wrapper 判定依据。POSIX direct child 自然退出后仍检查其原 process group，清理残留 descendants 后才返回；无法有界证明 group 消失则返回 125。
 
 helper 在启动子进程前把 timeout 限制到所有支持平台都可安全表示的上界；超过上界的十进制输入按参数错误拒绝并显示上限。runner 被 SIGINT/SIGTERM/SIGHUP 中断时先清理子树，再恢复原信号语义。
 
