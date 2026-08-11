@@ -37,6 +37,7 @@ cccc-skill/
 │   │   ├── cccc-common.sh
 │   │   ├── delegate.sh
 │   │   ├── consult.sh
+│   │   ├── publish-no-clobber.py
 │   │   └── run-with-timeout.py
 │   ├── references/
 │   │   ├── delegate.md
@@ -79,7 +80,7 @@ package.json
 -->
 ```
 
-每行表示一个仓库相对文件或目录前缀，不接受 glob、绝对路径与 `..`。wrapper 用 Git 前后快照验证本轮新增变化全部落在允许范围内；人类可读的“边界”章节仍保留，用来解释理由和禁止项。
+每行表示一个仓库相对文件或目录前缀，不接受 glob、绝对路径与 `..`。wrapper 用 Git 前后快照验证本轮 tracked 与非 ignored untracked 变化全部落在允许范围内；Git-ignored 路径始终不在该审计边界，wrapper 每次运行都明确警告，不能把允许路径描述为操作系统级写入隔离。人类可读的“边界”章节仍保留，用来解释理由和禁止项。
 
 运行前：
 
@@ -98,7 +99,7 @@ package.json
 
 模型沿用各 CLI 当前配置；`CCCC_MODEL` 与 `CCCC_EFFORT` 允许调用者显式覆盖。脚本不再声称能判断“更强模型”，也不强制升级用户模型或预算。
 
-子代理最终回复直接作为结构化 report 捕获，由 wrapper 在确认是本轮新产物后原子发布。wrapper 发现 HEAD 改变、缺少 report、策略外文件变化或 agent 非零退出时必须返回非零，不得把旧文件当成功回执。
+子代理最终回复直接作为结构化 report 捕获，由 wrapper 在确认是本轮新产物后先取得基于卡片 stem 的原子 claim，再把内容写入目标目录内的唯一临时文件，通过硬链接执行 no-clobber 原子发布；日志先发布，report/opinion 最后作为成功标记。目标或 claim 已存在、或平台不支持安全发布时失败，不退化成覆盖式 `mv`。wrapper 发现 HEAD 改变、缺少 report、策略外文件变化或 agent 非零退出时必须返回非零，不得把旧文件当成功回执。同一卡片并发运行只能有一个发布成功。
 
 ## consult 设计
 
@@ -108,7 +109,7 @@ Claude 顾问采用 `--safe-mode`、`--tools Read,Glob,Grep`、`--permission-mod
 
 Codex 顾问默认采用 `--ephemeral --sandbox read-only --ignore-user-config --ignore-rules`，保留 CLI 认证但不加载用户规则、MCP 与自定义 provider，形成严格模式。依赖 custom provider 的用户可显式设置 `CCCC_CODEX_CONFIG_MODE=inherit`；此时仍有文件系统只读沙箱，但 wrapper 必须警告第三方 MCP/connector 可能具有外部副作用，不能再宣称完整只读。
 
-wrapper 在顾问运行前后比较 HEAD 与工作树快照；除 wrapper 自己发布的 opinion/log 外出现任何变化都视为只读策略失守。文档统一使用“只读第二意见”，不承诺双方一定形成共识。
+consult 默认要求 clean worktree；显式使用 dirty 逃生口时，wrapper 对所有 Git tracked 与非 ignored untracked 路径做内容指纹快照，并警告 ignored 路径不在审计边界内。顾问运行前后 HEAD 或该快照出现任何变化都视为只读策略失守。观点与日志都带 target 后缀，使同一议题可分别咨询两端。文档统一使用“只读第二意见”，不承诺双方一定形成共识。
 
 ## 超时与进程清理
 
@@ -140,13 +141,13 @@ v1 用户必须把原来指向仓库根的链接迁移到 `skills/cccc/`。旧 `
 - 标准目录、frontmatter、description 长度、引用存在性与 `openai.yaml`；
 - 两个 CLI 三档权限的精确 argv；
 - 非法 target、timeout、绝对路径、`..`、Unicode、空格、symlink、FIFO；
-- stale report/opinion、空产物、非零退出、并发运行与原子发布；
+- stale report/opinion、空产物、非零退出、同一卡片并发竞争与 no-clobber 原子发布；
 - 任务卡允许路径区块缺失、非法或与实际 diff 不一致；
 - clean/dirty/unborn Git、违规 commit 和策略外文件变化；
 - 正常超时、TERM/KILL、自然返回 124；
 - `DELEGATE_DEPTH` 的未设置、0、1、非数字和算术表达式输入；
 - Claude consult 不加载 project hook/MCP/Skill，Codex consult 使用 read-only/ephemeral；
-- Linux、macOS、Windows Git Bash 的 CI 矩阵。
+- Linux、macOS、Windows Git Bash 的 CI 矩阵；POSIX-only 的信号、FIFO 与 symlink 语义按平台显式 skip，Windows 覆盖 direct-child terminate 与安全发布冲突。
 
 完成本地 mock 测试后，用全新子代理做至少三个 forward tests：delegate 路由、consult 决策、能力缺失/禁止委派。若本机认证可用，再在临时 Git 仓库做一次 Claude 与 Codex 的最小真实 smoke；所有真实测试不得触碰业务仓库。
 
