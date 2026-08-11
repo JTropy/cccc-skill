@@ -1122,7 +1122,12 @@ CLEANUP_SHIM
   chmod +x "$CASE_BIN/python3" || return 1
   CCCC_REAL_PYTHON="$real_python" CCCC_FAKE_REPO="$CASE_REPO" run_delegate claude
   assert_eq 125 "$CASE_RC" 'cleanup failure precedence' || return 1
-  case "$CASE_OUTPUT" in *agent_rc=125*) return 0 ;; esac
+  [ -e "$CASE_REPO/bad/cleanup-outside.txt" ] || {
+    test_diag 'cleanup-failure shim did not create the policy violation'
+    return 1
+  }
+  case "$CASE_OUTPUT" in *'runner outcome: kind=cleanup-failure'*) return 0 ;; esac
+  test_diag "cleanup-failure outcome was not authenticated: $CASE_OUTPUT"
   return 1
 }
 
