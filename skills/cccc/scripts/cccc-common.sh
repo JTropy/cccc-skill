@@ -1,0 +1,627 @@
+#!/usr/bin/env bash
+# Shared validation and publication primitives for cccc wrappers.
+# This file is sourced; it deliberately installs no traps and calls no exit.
+
+CCCC_COMMON_DIR=$(CDPATH= cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || return 1
+CCCC_TARGET_ARGV=()
+CCCC_ALLOWED_PATHS=()
+CCCC_ALLOWED_PATHS_COUNT=0
+
+cccc_die() {
+  printf 'cccc: error: %s\n' "$*" >&2
+  return 1
+}
+
+cccc_warn() {
+  printf 'cccc: warning: %s\n' "$*" >&2
+  return 0
+}
+
+cccc_require_command() {
+  local name=${1-}
+  if [ -z "$name" ] || ! command -v "$name" >/dev/null 2>&1; then
+    cccc_die "required command not found: ${name:-<empty>}"
+    return 1
+  fi
+  return 0
+}
+
+cccc_validate_depth() {
+  case ${1-} in
+    ''|0) return 0 ;;
+    *)
+      cccc_die 'DELEGATE_DEPTH must be unset or exactly 0'
+      return 1
+      ;;
+  esac
+}
+
+cccc_validate_timeout() {
+  local value=${1-}
+  case "$value" in
+    0|[1-9]|[1-9][0-9]*)
+      case "$value" in
+        *[!0-9]*) ;;
+        *) return 0 ;;
+      esac
+      ;;
+  esac
+  cccc_die 'timeout must be 0 or a positive decimal integer'
+  return 1
+}
+
+cccc_find_python3() {
+  local candidate path
+  CCCC_PYTHON=
+  for candidate in python3 python; do
+    path=$(type -P "$candidate" 2>/dev/null || true)
+    if [ -n "$path" ] && "$path" -c 'import sys; raise SystemExit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+      CCCC_PYTHON=$path
+      return 0
+    fi
+  done
+  cccc_die 'Python 3 is required (looked for python3, then python)'
+  return 1
+}
+
+_cccc_is_windows_git_bash() {
+  case ${MSYSTEM-} in
+    MINGW*|MSYS*|UCRT*) return 0 ;;
+  esac
+  case ${OSTYPE-} in
+    msys*|cygwin*|win32*) return 0 ;;
+  esac
+  return 1
+}
+
+_cccc_executable_path() {
+  local path
+  path=$(type -P "$1" 2>/dev/null || true)
+  if [ -n "$path" ] && [ -f "$path" ] && [ -x "$path" ]; then
+    printf '%s\n' "$path"
+    return 0
+  fi
+  return 1
+}
+
+_cccc_is_posix_shim() {
+  local path=$1 first_line
+  [ -f "$path" ] && [ -x "$path" ] && [ ! -L "$path" ] || return 1
+  IFS= read -r first_line <"$path" || [ -n "$first_line" ] || return 1
+  first_line=${first_line%$'\r'}
+  case "$first_line" in
+    '#!/bin/sh'|'#!/bin/bash'|'#!/usr/bin/sh'|'#!/usr/bin/bash'|'#!/usr/bin/env sh'|'#!/usr/bin/env bash')
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+_cccc_is_batch_path() {
+  case ${1-} in
+    *.[cC][mM][dD]|*.[bB][aA][tT]) return 0 ;;
+  esac
+  return 1
+}
+
+cccc_resolve_target_argv() {
+  local target=${1-} resolved batch
+  case "$target" in
+    claude|codex) ;;
+    *)
+      cccc_die 'target must be exactly claude or codex'
+      return 1
+      ;;
+  esac
+
+  CCCC_TARGET_ARGV=()
+  if _cccc_is_windows_git_bash; then
+    resolved=$(_cccc_executable_path "${target}.exe" || true)
+    if [ -n "$resolved" ]; then
+      CCCC_TARGET_ARGV=("$resolved")
+      return 0
+    fi
+
+    resolved=$(_cccc_executable_path "$target" || true)
+    if [ -n "$resolved" ]; then
+      if _cccc_is_batch_path "$resolved"; then
+        cccc_die "batch-only $target entry point is not supported"
+        return 1
+      fi
+      case "$resolved" in
+        *.[eE][xX][eE])
+          CCCC_TARGET_ARGV=("$resolved")
+          return 0
+          ;;
+      esac
+      if _cccc_is_posix_shim "$resolved"; then
+        CCCC_TARGET_ARGV=(bash "$resolved")
+        return 0
+      fi
+      cccc_die "$target resolved to neither a native executable nor a verified POSIX shim"
+      return 1
+    fi
+
+    batch=$(_cccc_executable_path "${target}.cmd" || true)
+    if [ -z "$batch" ]; then
+      batch=$(_cccc_executable_path "${target}.bat" || true)
+    fi
+    if [ -n "$batch" ]; then
+      cccc_die "batch-only $target entry point is not supported"
+    else
+      cccc_die "target command not found: $target"
+    fi
+    return 1
+  fi
+
+  resolved=$(_cccc_executable_path "$target" || true)
+  if [ -z "$resolved" ]; then
+    cccc_die "target command not found: $target"
+    return 1
+  fi
+  CCCC_TARGET_ARGV=("$resolved")
+  return 0
+}
+
+cccc_resolve_repo() {
+  local workdir=${1:-.} physical inside top root
+  if [ ! -d "$workdir" ]; then
+    cccc_die "workdir is not a directory: $workdir"
+    return 1
+  fi
+  physical=$(CDPATH= cd -P -- "$workdir" 2>/dev/null && pwd) || {
+    cccc_die "cannot resolve workdir: $workdir"
+    return 1
+  }
+  inside=$(git -C "$physical" rev-parse --is-inside-work-tree 2>/dev/null || true)
+  if [ "$inside" != true ]; then
+    cccc_die "workdir is not inside a Git worktree: $workdir"
+    return 1
+  fi
+  top=$(git -C "$physical" rev-parse --show-toplevel 2>/dev/null) || {
+    cccc_die "cannot resolve Git worktree root: $workdir"
+    return 1
+  }
+  root=$(CDPATH= cd -P -- "$top" 2>/dev/null && pwd) || {
+    cccc_die "cannot resolve physical Git worktree root: $top"
+    return 1
+  }
+  CCCC_REPO_ROOT=$root
+  return 0
+}
+
+_cccc_relative_path_is_safe() {
+  local path=${1-}
+  [ -n "$path" ] || return 1
+  case "$path" in
+    /*|\\*|[A-Za-z]:*|*\\*|*'//'*) return 1 ;;
+  esac
+  case "/$path/" in
+    */./*|*/../*) return 1 ;;
+  esac
+  return 0
+}
+
+_cccc_path_has_symlink_component() {
+  local root=$1 relative=$2 current=$1 component remainder=$2
+  while :; do
+    case "$remainder" in
+      */*)
+        component=${remainder%%/*}
+        remainder=${remainder#*/}
+        ;;
+      *)
+        component=$remainder
+        remainder=
+        ;;
+    esac
+    current="$current/$component"
+    [ -L "$current" ] && return 0
+    [ -n "$remainder" ] || break
+  done
+  return 1
+}
+
+cccc_validate_card() {
+  local card=${1-} expected_root=${2-} expected_dir expected_physical
+  local card_path card_dir card_dir_physical card_name
+  case "$expected_root" in
+    docs/tasks|docs/discussions) ;;
+    *)
+      cccc_die 'expected card root must be docs/tasks or docs/discussions'
+      return 1
+      ;;
+  esac
+  if [ -z "${CCCC_REPO_ROOT-}" ] || [ ! -d "$CCCC_REPO_ROOT" ]; then
+    cccc_die 'repository root has not been resolved'
+    return 1
+  fi
+  if ! _cccc_relative_path_is_safe "$card"; then
+    cccc_die "card path must be a safe repository-relative path: $card"
+    return 1
+  fi
+  case "$card" in
+    "$expected_root"/*.md) ;;
+    *)
+      cccc_die "card must be a Markdown file under $expected_root/"
+      return 1
+      ;;
+  esac
+
+  if _cccc_path_has_symlink_component "$CCCC_REPO_ROOT" "$card"; then
+    cccc_die "card path must not contain symlink components: $card"
+    return 1
+  fi
+
+  expected_dir="$CCCC_REPO_ROOT/$expected_root"
+  if [ ! -d "$expected_dir" ] || [ -L "$expected_dir" ]; then
+    cccc_die "card root is missing or is a symlink: $expected_root"
+    return 1
+  fi
+  expected_physical=$(CDPATH= cd -P -- "$expected_dir" 2>/dev/null && pwd) || return 1
+  if [ "$expected_physical" != "$expected_dir" ]; then
+    cccc_die "card root does not resolve to its physical repository location: $expected_root"
+    return 1
+  fi
+
+  card_path="$CCCC_REPO_ROOT/$card"
+  if [ -L "$card_path" ] || [ ! -f "$card_path" ]; then
+    cccc_die "card must be a regular, non-symlink file: $card"
+    return 1
+  fi
+  card_dir=$(dirname -- "$card_path")
+  card_dir_physical=$(CDPATH= cd -P -- "$card_dir" 2>/dev/null && pwd) || {
+    cccc_die "cannot resolve card directory: $card"
+    return 1
+  }
+  case "$card_dir_physical/" in
+    "$expected_physical/"*) ;;
+    *)
+      cccc_die "card resolves outside $expected_root/: $card"
+      return 1
+      ;;
+  esac
+  card_name=$(basename -- "$card_path")
+  CCCC_CARD_REL=$card
+  CCCC_CARD_ABS="$card_dir_physical/$card_name"
+  return 0
+}
+
+cccc_make_run_dir() {
+  local temp_root=${TMPDIR:-/tmp} run_dir
+  if [ ! -d "$temp_root" ]; then
+    cccc_die "temporary directory root does not exist: $temp_root"
+    return 1
+  fi
+  run_dir=$(umask 077 && mktemp -d "$temp_root/cccc.XXXXXXXX") || {
+    cccc_die "cannot create private run directory under $temp_root"
+    return 1
+  }
+  if ! chmod 700 "$run_dir"; then
+    rmdir -- "$run_dir" 2>/dev/null || true
+    cccc_die 'cannot enforce mode 700 on private run directory'
+    return 1
+  fi
+  CCCC_RUN_DIR=$run_dir
+  return 0
+}
+
+cccc_refuse_output_target() {
+  local destination=${1-}
+  if [ -z "$destination" ]; then
+    cccc_die 'output destination is empty'
+    return 1
+  fi
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    cccc_die "output destination already exists: $destination"
+    return 1
+  fi
+  return 0
+}
+
+cccc_acquire_claim() {
+  local claim=${1-}
+  CCCC_CLAIM_DIR=
+  if [ -z "$claim" ]; then
+    cccc_die 'claim path is empty'
+    return 1
+  fi
+  if ! (umask 077 && mkdir -- "$claim") 2>/dev/null; then
+    cccc_die "publication claim is already held or unavailable: $claim"
+    return 5
+  fi
+  if ! chmod 700 "$claim"; then
+    rmdir -- "$claim" 2>/dev/null || true
+    cccc_die "cannot enforce mode 700 on publication claim: $claim"
+    return 5
+  fi
+  CCCC_CLAIM_DIR=$claim
+  return 0
+}
+
+cccc_atomic_publish() {
+  local source=${1-} destination=${2-}
+  if [ -z "$source" ] || [ -z "$destination" ]; then
+    cccc_die 'atomic publish requires source and destination'
+    return 1
+  fi
+  cccc_find_python3 || return 1
+  "$CCCC_PYTHON" "$CCCC_COMMON_DIR/publish-no-clobber.py" "$source" "$destination"
+}
+
+cccc_git_head() {
+  local repo=${1:-${CCCC_REPO_ROOT-}} head
+  if [ -z "$repo" ] || [ "$(git -C "$repo" rev-parse --is-inside-work-tree 2>/dev/null || true)" != true ]; then
+    cccc_die 'cannot read HEAD outside a Git worktree'
+    return 1
+  fi
+  head=$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || true)
+  if [ -n "$head" ]; then
+    printf '%s\n' "$head"
+  else
+    printf '%s\n' 'CCCC_UNBORN_HEAD'
+  fi
+}
+
+cccc_git_snapshot() {
+  local repo=${1-} output=${2-}
+  [ -n "$repo" ] && [ -n "$output" ] || {
+    cccc_die 'git snapshot requires repository and output file'
+    return 1
+  }
+  cccc_find_python3 || return 1
+  "$CCCC_PYTHON" - "$repo" "$output" <<'PY'
+import hashlib
+import os
+import stat
+import subprocess
+import sys
+
+root, output = sys.argv[1:]
+result = subprocess.run(
+    ["git", "-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+)
+if result.returncode:
+    sys.stderr.buffer.write(result.stderr)
+    raise SystemExit(result.returncode)
+
+index_result = subprocess.run(
+    ["git", "-C", root, "ls-files", "-z", "--stage"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+)
+if index_result.returncode:
+    sys.stderr.buffer.write(index_result.stderr)
+    raise SystemExit(index_result.returncode)
+index_records = {}
+for record in (item for item in index_result.stdout.split(b"\0") if item):
+    if b"\t" not in record:
+        raise SystemExit("invalid NUL-safe Git index record")
+    metadata, relative = record.split(b"\t", 1)
+    index_records.setdefault(relative, []).append(metadata)
+
+root_bytes = os.fsencode(root)
+
+def fingerprint(relative):
+    full = os.path.join(root_bytes, relative)
+    try:
+        before = os.lstat(full)
+    except FileNotFoundError:
+        return b"missing", hashlib.sha256(b"").hexdigest().encode("ascii")
+
+    mode = before.st_mode
+    permissions = (mode & 0o7777)
+    if stat.S_ISREG(mode):
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(full, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise RuntimeError("Git-visible path changed type during snapshot")
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                raise RuntimeError("Git-visible path changed during snapshot")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            stable_before = (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+            stable_after = (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            if stable_before != stable_after:
+                raise RuntimeError("Git-visible file changed while being fingerprinted")
+            return ("regular:%04o" % permissions).encode("ascii"), digest.hexdigest().encode("ascii")
+        finally:
+            os.close(descriptor)
+    if stat.S_ISLNK(mode):
+        target = os.readlink(full)
+        if not isinstance(target, bytes):
+            target = os.fsencode(target)
+        return b"symlink", hashlib.sha256(target).hexdigest().encode("ascii")
+    if stat.S_ISFIFO(mode):
+        kind = b"fifo"
+    elif stat.S_ISDIR(mode):
+        kind = b"directory"
+    elif stat.S_ISSOCK(mode):
+        kind = b"socket"
+    elif stat.S_ISCHR(mode):
+        kind = b"character"
+    elif stat.S_ISBLK(mode):
+        kind = b"block"
+    else:
+        kind = b"other"
+    return kind + (b":%04o" % permissions), hashlib.sha256(b"").hexdigest().encode("ascii")
+
+paths = sorted(set(path for path in result.stdout.split(b"\0") if path))
+with open(output, "wb") as stream:
+    for relative in paths:
+        kind, digest = fingerprint(relative)
+        index_state = b"|".join(sorted(index_records.get(relative, [b"untracked"])))
+        stream.write(
+            relative.hex().encode("ascii")
+            + b"\t" + kind
+            + b"\t" + digest
+            + b"\t" + index_state.hex().encode("ascii")
+            + b"\n"
+        )
+    stream.flush()
+    os.fsync(stream.fileno())
+PY
+}
+
+cccc_snapshot_equal() {
+  local before=${1-} after=${2-}
+  [ -f "$before" ] && [ -f "$after" ] || return 1
+  cmp -s -- "$before" "$after"
+}
+
+cccc_snapshot_changed_paths() {
+  local before=${1-} after=${2-} output=${3-}
+  [ -f "$before" ] && [ -f "$after" ] && [ -n "$output" ] || {
+    cccc_die 'changed-path comparison requires two snapshots and an output file'
+    return 1
+  }
+  cccc_find_python3 || return 1
+  "$CCCC_PYTHON" - "$before" "$after" "$output" <<'PY'
+import os
+import sys
+
+before_path, after_path, output_path = sys.argv[1:]
+
+def read_snapshot(path):
+    records = {}
+    with open(path, "rb") as stream:
+        for number, raw_line in enumerate(stream, 1):
+            fields = raw_line.rstrip(b"\n").split(b"\t")
+            if len(fields) != 4:
+                raise SystemExit("invalid snapshot record at line %d" % number)
+            try:
+                relative = bytes.fromhex(fields[0].decode("ascii"))
+            except (UnicodeDecodeError, ValueError):
+                raise SystemExit("invalid snapshot path at line %d" % number)
+            if not relative or b"\0" in relative or relative in records:
+                raise SystemExit("invalid or duplicate snapshot path at line %d" % number)
+            records[relative] = (fields[1], fields[2], fields[3])
+    return records
+
+before = read_snapshot(before_path)
+after = read_snapshot(after_path)
+changed = sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
+with open(output_path, "wb") as stream:
+    for path in changed:
+        stream.write(path + b"\0")
+    stream.flush()
+    os.fsync(stream.fileno())
+PY
+}
+
+cccc_git_status_z() {
+  local repo=${1-} output=${2-}
+  [ -n "$repo" ] && [ -n "$output" ] || {
+    cccc_die 'git status requires repository and output file'
+    return 1
+  }
+  git -C "$repo" status --porcelain=v1 -z --untracked-files=all --ignored=no >"$output"
+}
+
+cccc_git_has_ignored_paths() {
+  local repo=${1:-${CCCC_REPO_ROOT-}}
+  [ -n "$repo" ] || return 1
+  cccc_find_python3 || return 1
+  "$CCCC_PYTHON" - "$repo" <<'PY'
+import subprocess
+import sys
+
+result = subprocess.run(
+    ["git", "-C", sys.argv[1], "ls-files", "-z", "--others", "--ignored", "--exclude-standard"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+)
+if result.returncode:
+    sys.stderr.buffer.write(result.stderr)
+    raise SystemExit(result.returncode)
+raise SystemExit(0 if result.stdout else 1)
+PY
+}
+
+cccc_warn_ignored_audit_boundary() {
+  cccc_warn 'Git-ignored paths are outside the cccc Git-visible audit boundary'
+}
+
+_cccc_validate_policy_path() {
+  local path=${1-}
+  _cccc_relative_path_is_safe "$path" || return 1
+  case "$path" in
+    ' '*|*' '|*$'\t'*|*'*'*|*'?'*|*'['*|*']'*) return 1 ;;
+  esac
+  return 0
+}
+
+cccc_parse_allowed_paths() {
+  local card=${1-} line in_block=0 blocks=0 count=0
+  CCCC_ALLOWED_PATHS=()
+  CCCC_ALLOWED_PATHS_COUNT=0
+  if [ ! -f "$card" ] || [ -L "$card" ]; then
+    cccc_die 'allowed-path policy source must be a regular, non-symlink card'
+    return 1
+  fi
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    if [ "$line" = '<!-- cccc-allowed-paths' ]; then
+      if [ "$in_block" -ne 0 ] || [ "$blocks" -ne 0 ]; then
+        cccc_die 'task card must contain exactly one allowed-paths block'
+        return 1
+      fi
+      in_block=1
+      blocks=1
+      continue
+    fi
+    if [ "$line" = '-->' ] && [ "$in_block" -eq 1 ]; then
+      in_block=0
+      continue
+    fi
+    if [ "$in_block" -eq 1 ]; then
+      if ! _cccc_validate_policy_path "$line"; then
+        cccc_die "invalid allowed path: $line"
+        return 1
+      fi
+      CCCC_ALLOWED_PATHS[$count]=$line
+      count=$((count + 1))
+    fi
+  done <"$card"
+
+  if [ "$blocks" -ne 1 ] || [ "$in_block" -ne 0 ] || [ "$count" -eq 0 ]; then
+    cccc_die 'task card requires one non-empty, closed allowed-paths block'
+    return 1
+  fi
+  CCCC_ALLOWED_PATHS_COUNT=$count
+  return 0
+}
+
+cccc_path_allowed() {
+  local path=${1-} index=0 rule prefix
+  _cccc_relative_path_is_safe "$path" || return 1
+  while [ "$index" -lt "${CCCC_ALLOWED_PATHS_COUNT:-0}" ]; do
+    rule=${CCCC_ALLOWED_PATHS[$index]}
+    case "$rule" in
+      */)
+        prefix=${rule%/}
+        case "$path" in
+          "$prefix"/*) return 0 ;;
+        esac
+        ;;
+      *)
+        [ "$path" = "$rule" ] && return 0
+        ;;
+    esac
+    index=$((index + 1))
+  done
+  return 1
+}
