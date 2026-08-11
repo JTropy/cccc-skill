@@ -1111,7 +1111,15 @@ if [ "$intercept" -eq 1 ]; then
   mkdir -p "$CCCC_FAKE_REPO/bad"
   printf 'outside during cleanup failure\n' >"$CCCC_FAKE_REPO/bad/cleanup-outside.txt"
   if [ -n "$status_file" ] && [ -n "$token_file" ]; then
-    "$CCCC_REAL_PYTHON" -I "$CCCC_AUTH_STATUS_HELPER" \
+    auth_helper=$CCCC_AUTH_STATUS_HELPER
+    case ${MSYSTEM-} in
+      MINGW*|MSYS*|UCRT*)
+        auth_helper=$(cygpath -w "$auth_helper") || exit 125
+        token_file=$(cygpath -w "$token_file") || exit 125
+        status_file=$(cygpath -w "$status_file") || exit 125
+        ;;
+    esac
+    "$CCCC_REAL_PYTHON" -I "$auth_helper" \
       "$token_file" "$status_file" cleanup-failure none || exit 125
   fi
   printf '%s\n' 'cccc-timeout: cleanup failed: injected wrapper test' >&2
