@@ -116,9 +116,12 @@ consult 默认要求 clean worktree；显式使用 dirty 逃生口时，wrapper 
 用 Python 3 标准库实现 `run-with-timeout.py`：
 
 - Unix 创建独立进程组，超时先发 TERM，宽限期后发 KILL；
-- Windows 使用新进程组并执行 terminate/kill；
-- wrapper 超时统一返回 124，同时保留原始 `agent_rc` 与 wrapper 失败原因；
+- Windows 使用新进程组与 kill-on-close Job Object 清理整棵子进程树；
+- wrapper 在成功完成超时清理后返回 124，同时保留原始 `agent_rc` 与 wrapper 失败原因；
+- 124 只表示 deadline 已触发且子进程清理完成；若 signal/job/reap 清理失败则返回 125，避免把残留进程伪装成普通超时；
 - `CCCC_TIMEOUT=0` 才表示调用者明确接受不限时。
+
+helper 在启动子进程前把 timeout 限制到所有支持平台都可安全表示的上界；超过上界的十进制输入按参数错误拒绝并显示上限。runner 被 SIGINT/SIGTERM/SIGHUP 中断时先清理子树，再恢复原信号语义。
 
 Python 3 因此成为 v2 的明确依赖；wrapper 在不同平台依次查找 `python3` 与 `python` 并验证主版本，不再在 macOS 缺少 `timeout` 时悄悄退化成无限运行。
 
