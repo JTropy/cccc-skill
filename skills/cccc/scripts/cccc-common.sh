@@ -105,7 +105,8 @@ _cccc_is_batch_path() {
 }
 
 cccc_resolve_target_argv() {
-  local target=${1-} resolved batch
+  local target=${1-} resolved
+  CCCC_TARGET_ARGV=()
   case "$target" in
     claude|codex) ;;
     *)
@@ -114,44 +115,9 @@ cccc_resolve_target_argv() {
       ;;
   esac
 
-  CCCC_TARGET_ARGV=()
   if _cccc_is_windows_git_bash; then
-    resolved=$(_cccc_executable_path "${target}.exe" || true)
-    if [ -n "$resolved" ]; then
-      CCCC_TARGET_ARGV=("$resolved")
-      return 0
-    fi
-
-    resolved=$(_cccc_executable_path "$target" || true)
-    if [ -n "$resolved" ]; then
-      if _cccc_is_batch_path "$resolved"; then
-        cccc_die "batch-only $target entry point is not supported"
-        return 1
-      fi
-      case "$resolved" in
-        *.[eE][xX][eE])
-          CCCC_TARGET_ARGV=("$resolved")
-          return 0
-          ;;
-      esac
-      if _cccc_is_posix_shim "$resolved"; then
-        CCCC_TARGET_ARGV=(bash "$resolved")
-        return 0
-      fi
-      cccc_die "$target resolved to neither a native executable nor a verified POSIX shim"
-      return 1
-    fi
-
-    batch=$(_cccc_executable_path "${target}.cmd" || true)
-    if [ -z "$batch" ]; then
-      batch=$(_cccc_executable_path "${target}.bat" || true)
-    fi
-    if [ -n "$batch" ]; then
-      cccc_die "batch-only $target entry point is not supported"
-    else
-      cccc_die "target command not found: $target"
-    fi
-    return 1
+    _cccc_resolve_windows_target_argv "$target"
+    return $?
   fi
 
   resolved=$(_cccc_executable_path "$target" || true)
@@ -163,8 +129,69 @@ cccc_resolve_target_argv() {
   return 0
 }
 
+_cccc_resolve_windows_target_argv() {
+  local target=$1 remaining=${PATH-} segment more directory candidate
+  while :; do
+    case "$remaining" in
+      *:*)
+        segment=${remaining%%:*}
+        remaining=${remaining#*:}
+        more=1
+        ;;
+      *)
+        segment=$remaining
+        remaining=
+        more=0
+        ;;
+    esac
+    [ -n "$segment" ] || segment=.
+    directory=$(CDPATH= cd -P -- "$segment" 2>/dev/null && pwd) || directory=
+    if [ -n "$directory" ]; then
+      candidate="$directory/${target}.exe"
+      if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+        if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+          CCCC_TARGET_ARGV=("$candidate")
+          return 0
+        fi
+        cccc_die "$target has an invalid native executable in the first matching PATH directory"
+        return 1
+      fi
+
+      candidate="$directory/$target"
+      if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+        if _cccc_is_posix_shim "$candidate"; then
+          CCCC_TARGET_ARGV=(bash "$candidate")
+          return 0
+        fi
+        cccc_die "$target has an invalid extensionless entry in the first matching PATH directory"
+        return 1
+      fi
+
+      candidate="$directory/${target}.com"
+      if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+        cccc_die "$target has an unsupported .com entry in the first matching PATH directory"
+        return 1
+      fi
+      candidate="$directory/${target}.cmd"
+      if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+        cccc_die "batch-only $target entry point is not supported"
+        return 1
+      fi
+      candidate="$directory/${target}.bat"
+      if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+        cccc_die "batch-only $target entry point is not supported"
+        return 1
+      fi
+    fi
+    [ "$more" -eq 1 ] || break
+  done
+  cccc_die "target command not found: $target"
+  return 1
+}
+
 cccc_resolve_repo() {
   local workdir=${1:-.} physical inside top root
+  CCCC_REPO_ROOT=
   if [ ! -d "$workdir" ]; then
     cccc_die "workdir is not a directory: $workdir"
     return 1
@@ -225,6 +252,8 @@ _cccc_path_has_symlink_component() {
 cccc_validate_card() {
   local card=${1-} expected_root=${2-} expected_dir expected_physical
   local card_path card_dir card_dir_physical card_name
+  CCCC_CARD_REL=
+  CCCC_CARD_ABS=
   case "$expected_root" in
     docs/tasks|docs/discussions) ;;
     *)
@@ -289,6 +318,7 @@ cccc_validate_card() {
 
 cccc_make_run_dir() {
   local temp_root=${TMPDIR:-/tmp} run_dir
+  CCCC_RUN_DIR=
   if [ ! -d "$temp_root" ]; then
     cccc_die "temporary directory root does not exist: $temp_root"
     return 1
@@ -376,8 +406,17 @@ import os
 import stat
 import subprocess
 import sys
+import tempfile
 
 root, output = sys.argv[1:]
+try:
+    os.unlink(output)
+except FileNotFoundError:
+    pass
+except OSError as error:
+    print("cccc snapshot: cannot clear previous output: %s" % error, file=sys.stderr)
+    raise SystemExit(5)
+
 result = subprocess.run(
     ["git", "-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
     stdout=subprocess.PIPE,
@@ -402,6 +441,13 @@ for record in (item for item in index_result.stdout.split(b"\0") if item):
     if b"\t" not in record:
         raise SystemExit("invalid NUL-safe Git index record")
     metadata, relative = record.split(b"\t", 1)
+    if metadata.split(b" ", 1)[0] == b"160000":
+        print(
+            "cccc snapshot: submodule/gitlink paths are unsupported: %r"
+            % os.fsdecode(relative),
+            file=sys.stderr,
+        )
+        raise SystemExit(5)
     index_records.setdefault(relative, []).append(metadata)
 
 root_bytes = os.fsencode(root)
@@ -446,7 +492,12 @@ def fingerprint(relative):
     if stat.S_ISFIFO(mode):
         kind = b"fifo"
     elif stat.S_ISDIR(mode):
-        kind = b"directory"
+        print(
+            "cccc snapshot: nested repositories or enumerated directories are unsupported: %r"
+            % os.fsdecode(relative),
+            file=sys.stderr,
+        )
+        raise SystemExit(5)
     elif stat.S_ISSOCK(mode):
         kind = b"socket"
     elif stat.S_ISCHR(mode):
@@ -458,19 +509,41 @@ def fingerprint(relative):
     return kind + (b":%04o" % permissions), hashlib.sha256(b"").hexdigest().encode("ascii")
 
 paths = sorted(set(path for path in result.stdout.split(b"\0") if path))
-with open(output, "wb") as stream:
-    for relative in paths:
-        kind, digest = fingerprint(relative)
-        index_state = b"|".join(sorted(index_records.get(relative, [b"untracked"])))
-        stream.write(
-            relative.hex().encode("ascii")
-            + b"\t" + kind
-            + b"\t" + digest
-            + b"\t" + index_state.hex().encode("ascii")
-            + b"\n"
-        )
-    stream.flush()
-    os.fsync(stream.fileno())
+snapshot_records = []
+for relative in paths:
+    kind, digest = fingerprint(relative)
+    index_state = b"|".join(sorted(index_records.get(relative, [b"untracked"])))
+    snapshot_records.append(
+        relative.hex().encode("ascii")
+        + b"\t" + kind
+        + b"\t" + digest
+        + b"\t" + index_state.hex().encode("ascii")
+        + b"\n"
+    )
+
+output_directory = os.path.dirname(os.path.abspath(output))
+temporary_fd = None
+temporary_path = None
+try:
+    temporary_fd, temporary_path = tempfile.mkstemp(
+        prefix=".cccc-snapshot-", dir=output_directory
+    )
+    with os.fdopen(temporary_fd, "wb", closefd=True) as stream:
+        temporary_fd = None
+        for record in snapshot_records:
+            stream.write(record)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary_path, output)
+    temporary_path = None
+finally:
+    if temporary_fd is not None:
+        os.close(temporary_fd)
+    if temporary_path is not None:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
 PY
 }
 
@@ -563,8 +636,74 @@ _cccc_validate_policy_path() {
   return 0
 }
 
+_cccc_validate_allowed_path_physical() {
+  local rule=$1 relative=$1 directory_rule=0 current remainder component candidate
+  local candidate_physical more
+  if [ -z "${CCCC_REPO_ROOT-}" ] || [ ! -d "$CCCC_REPO_ROOT" ]; then
+    cccc_die 'repository root must be resolved before parsing allowed paths'
+    return 1
+  fi
+  case "$relative" in
+    */)
+      directory_rule=1
+      relative=${relative%/}
+      ;;
+  esac
+  [ -n "$relative" ] || return 1
+  current=$CCCC_REPO_ROOT
+  remainder=$relative
+  while :; do
+    case "$remainder" in
+      */*)
+        component=${remainder%%/*}
+        remainder=${remainder#*/}
+        more=1
+        ;;
+      *)
+        component=$remainder
+        remainder=
+        more=0
+        ;;
+    esac
+    candidate="$current/$component"
+    if [ -L "$candidate" ]; then
+      cccc_die "allowed path contains a symlink component: $rule"
+      return 1
+    fi
+    if [ -e "$candidate" ]; then
+      if [ -d "$candidate" ]; then
+        candidate_physical=$(CDPATH= cd -P -- "$candidate" 2>/dev/null && pwd) || return 1
+        case "$candidate_physical/" in
+          "$CCCC_REPO_ROOT/"*) ;;
+          *)
+            cccc_die "allowed path resolves outside the repository: $rule"
+            return 1
+            ;;
+        esac
+        if [ "$more" -eq 0 ] && [ "$directory_rule" -eq 0 ]; then
+          cccc_die "existing allowed directory requires a trailing slash: $rule"
+          return 1
+        fi
+        current=$candidate_physical
+      elif [ -f "$candidate" ]; then
+        if [ "$more" -eq 1 ] || [ "$directory_rule" -eq 1 ]; then
+          cccc_die "allowed file cannot be used as a directory prefix: $rule"
+          return 1
+        fi
+      else
+        cccc_die "allowed path has an unsupported existing file type: $rule"
+        return 1
+      fi
+    else
+      return 0
+    fi
+    [ "$more" -eq 1 ] || return 0
+  done
+}
+
 cccc_parse_allowed_paths() {
   local card=${1-} line in_block=0 blocks=0 count=0
+  local parsed_paths=()
   CCCC_ALLOWED_PATHS=()
   CCCC_ALLOWED_PATHS_COUNT=0
   if [ ! -f "$card" ] || [ -L "$card" ]; then
@@ -592,7 +731,10 @@ cccc_parse_allowed_paths() {
         cccc_die "invalid allowed path: $line"
         return 1
       fi
-      CCCC_ALLOWED_PATHS[$count]=$line
+      if ! _cccc_validate_allowed_path_physical "$line"; then
+        return 1
+      fi
+      parsed_paths[$count]=$line
       count=$((count + 1))
     fi
   done <"$card"
@@ -601,7 +743,9 @@ cccc_parse_allowed_paths() {
     cccc_die 'task card requires one non-empty, closed allowed-paths block'
     return 1
   fi
+  CCCC_ALLOWED_PATHS=("${parsed_paths[@]}")
   CCCC_ALLOWED_PATHS_COUNT=$count
+  cccc_warn 'allowed paths are a post-run Git audit boundary, not OS-level write isolation'
   return 0
 }
 

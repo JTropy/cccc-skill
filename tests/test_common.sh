@@ -128,6 +128,7 @@ EOF
 test_windows_target_resolution_preserves_argv() {
   local tmp old_path
   tmp=$(new_test_dir) || return 1
+  tmp=$(CDPATH= cd -P -- "$tmp" && pwd) || return 1
   mkdir "$tmp/native" "$tmp/shim" "$tmp/batch"
   cp "$TEST_DIR/fixtures/fake-agent.sh" "$tmp/native/claude.exe"
   chmod +x "$tmp/native/claude.exe"
@@ -190,6 +191,61 @@ expected = ['space arg', '$(touch should-not-exist)', '; echo injected']
 if args != expected:
     raise SystemExit(f'argv boundary lost: {args!r}')
 PY
+}
+
+test_windows_target_resolution_honors_path_precedence() {
+  local tmp early later bad batch com old_path
+  tmp=$(new_test_dir) || return 1
+  tmp=$(CDPATH= cd -P -- "$tmp" && pwd) || return 1
+  early="$tmp/early shim"
+  later="$tmp/later-native"
+  bad="$tmp/early-invalid"
+  batch="$tmp/early-batch"
+  com="$tmp/early-com"
+  mkdir "$early" "$later" "$bad" "$batch" "$com"
+  cp "$TEST_DIR/fixtures/fake-agent.sh" "$early/codex"
+  cp "$TEST_DIR/fixtures/fake-agent.sh" "$later/codex.exe"
+  chmod +x "$early/codex" "$later/codex.exe"
+  old_path=$PATH
+  PATH="$early:$later:$old_path"
+  MSYSTEM=MINGW64 cccc_resolve_target_argv codex || return 1
+  assert_eq 2 "${#CCCC_TARGET_ARGV[@]}" "earlier shim argv length" || return 1
+  assert_eq bash "${CCCC_TARGET_ARGV[0]}" "earlier shim interpreter" || return 1
+  assert_eq "$early/codex" "${CCCC_TARGET_ARGV[1]}" "PATH precedence" || return 1
+  CCCC_FAKE_ARGV_FILE="$tmp/precedence-argv.z" "${CCCC_TARGET_ARGV[@]}" 'one arg' ';not-shell' || return 1
+  python3 - "$tmp/precedence-argv.z" <<'PY' || return 1
+import sys
+actual = [item.decode() for item in open(sys.argv[1], 'rb').read().split(b'\0') if item]
+if actual != ['one arg', ';not-shell']:
+    raise SystemExit(f'precedence argv mismatch: {actual!r}')
+PY
+  (
+    cd "$tmp" || exit 1
+    PATH="early shim:$later:$old_path"
+    MSYSTEM=MINGW64 cccc_resolve_target_argv codex || exit 1
+    [ "${CCCC_TARGET_ARGV[1]}" = "$early/codex" ]
+  ) || return 1
+  (
+    cd "$early" || exit 1
+    PATH=":$later:$old_path"
+    MSYSTEM=MINGW64 cccc_resolve_target_argv codex || exit 1
+    [ "${CCCC_TARGET_ARGV[1]}" = "$early/codex" ]
+  ) || return 1
+
+  printf '%s\n' '#!/usr/bin/env python3' 'raise SystemExit(0)' >"$bad/codex"
+  chmod +x "$bad/codex"
+  PATH="$bad:$later:$old_path"
+  assert_fails env MSYSTEM=MINGW64 PATH="$PATH" bash -c '. "$1"; cccc_resolve_target_argv codex' _ "$COMMON" || return 1
+
+  printf '%s\n' '@echo off' >"$batch/codex.cmd"
+  chmod +x "$batch/codex.cmd"
+  PATH="$batch:$later:$old_path"
+  assert_fails env MSYSTEM=MINGW64 PATH="$PATH" bash -c '. "$1"; cccc_resolve_target_argv codex' _ "$COMMON" || return 1
+  cp "$TEST_DIR/fixtures/fake-agent.sh" "$com/codex.com"
+  chmod +x "$com/codex.com"
+  PATH="$com:$later:$old_path"
+  assert_fails env MSYSTEM=MINGW64 PATH="$PATH" bash -c '. "$1"; cccc_resolve_target_argv codex' _ "$COMMON" || return 1
+  PATH=$old_path
 }
 
 test_repo_resolution_and_unborn_head() {
@@ -407,8 +463,13 @@ write_policy_card() {
 }
 
 test_allowed_paths_parse_and_match_exactly() {
-  local tmp card
+  local tmp card repo
   tmp=$(new_test_dir) || return 1
+  repo="$tmp/repo"
+  init_test_repo "$repo" || return 1
+  mkdir -p "$repo/frontend" "$repo/tests/界 面"
+  printf '{}\n' >"$repo/package.json"
+  cccc_resolve_repo "$repo" || return 1
   card="$tmp/card.md"
   write_policy_card "$card" 'frontend/' 'tests/界 面/' 'package.json'
   cccc_parse_allowed_paths "$card" || return 1
@@ -425,9 +486,12 @@ test_allowed_paths_parse_and_match_exactly() {
 }
 
 test_allowed_paths_reject_ambiguous_policy() {
-  local tmp card value
+  local tmp card value repo
   [ "$COMMON_LOADED" -eq 1 ] || return 1
   tmp=$(new_test_dir) || return 1
+  repo="$tmp/repo"
+  init_test_repo "$repo" || return 1
+  cccc_resolve_repo "$repo" || return 1
   card="$tmp/card.md"
   write_policy_card "$card"
   assert_fails cccc_parse_allowed_paths "$card" || return 1
@@ -445,6 +509,70 @@ test_allowed_paths_reject_ambiguous_policy() {
   printf '%s\r\n' '<!-- cccc-allowed-paths' 'src/' 'package.json' '-->' >"$card"
   cccc_parse_allowed_paths "$card" || return 1
   assert_eq 2 "$CCCC_ALLOWED_PATHS_COUNT" "CRLF policy count"
+}
+
+test_allowed_paths_reject_symlinks_and_invalid_existing_shapes() {
+  local tmp repo card output
+  tmp=$(new_test_dir) || return 1
+  repo="$tmp/repo"
+  init_test_repo "$repo" || return 1
+  mkdir "$repo/allowed-dir" "$tmp/outside"
+  printf 'file\n' >"$repo/existing-file"
+  if ! ln -s allowed-dir "$repo/link-inside" 2>/dev/null; then
+    return 77
+  fi
+  ln -s "$tmp/outside" "$repo/link-outside" || return 1
+  ln -s missing-target "$repo/dangling" || return 1
+  cccc_resolve_repo "$repo" || return 1
+  card="$tmp/card.md"
+  for rule in 'link-inside/' 'link-outside/' 'dangling/' 'allowed-dir' 'existing-file/' 'existing-file/child'; do
+    write_policy_card "$card" "$rule"
+    assert_fails cccc_parse_allowed_paths "$card" || {
+      test_diag "accepted unsafe existing allowed path: $rule"
+      return 1
+    }
+  done
+  write_policy_card "$card" 'allowed-dir/' 'existing-file' 'new/path.md' 'new-directory/'
+  output=$(cccc_parse_allowed_paths "$card" 2>&1) || return 1
+  printf '%s' "$output" | grep -qi 'audit.*not.*OS' || {
+    test_diag "missing audit-only warning: $output"
+    return 1
+  }
+}
+
+test_return_globals_are_cleared_before_failure() {
+  local tmp repo old_path target_count
+  tmp=$(new_test_dir) || return 1
+  mkdir "$tmp/empty-path"
+  CCCC_TARGET_ARGV=(stale)
+  assert_fails cccc_resolve_target_argv invalid || return 1
+  set +u
+  target_count=${#CCCC_TARGET_ARGV[@]}
+  set -u
+  assert_eq 0 "$target_count" "stale target argv" || return 1
+
+  CCCC_REPO_ROOT=stale
+  assert_fails cccc_resolve_repo "$tmp/missing" || return 1
+  [ -z "${CCCC_REPO_ROOT-}" ] || return 1
+
+  repo="$tmp/repo"
+  make_card_repo "$repo" || return 1
+  cccc_resolve_repo "$repo" || return 1
+  CCCC_CARD_REL=stale
+  CCCC_CARD_ABS=stale
+  assert_fails cccc_validate_card /absolute.md docs/tasks || return 1
+  [ -z "${CCCC_CARD_REL-}" ] && [ -z "${CCCC_CARD_ABS-}" ] || return 1
+
+  CCCC_RUN_DIR=stale
+  TMPDIR="$tmp/missing-tmp" assert_fails cccc_make_run_dir || return 1
+  [ -z "${CCCC_RUN_DIR-}" ] || return 1
+
+  old_path=$PATH
+  CCCC_PYTHON=stale
+  PATH="$tmp/empty-path"
+  assert_fails cccc_find_python3 || return 1
+  [ -z "${CCCC_PYTHON-}" ] || return 1
+  PATH=$old_path
 }
 
 test_snapshot_fingerprints_visible_content_and_ignores_ignored() {
@@ -620,6 +748,48 @@ test_snapshot_detects_symlink_target() {
   assert_fails cccc_snapshot_equal "$before" "$after"
 }
 
+test_snapshot_rejects_real_submodule_gitlink() {
+  local tmp source repo output
+  tmp=$(new_test_dir) || return 1
+  source="$tmp/source-repo"
+  repo="$tmp/parent-repo"
+  init_test_repo "$source" || return 1
+  printf 'source\n' >"$source/file"
+  git -C "$source" add file || return 1
+  git -C "$source" commit -qm initial || return 1
+  init_test_repo "$repo" || return 1
+  printf 'parent\n' >"$repo/README"
+  git -C "$repo" add README || return 1
+  git -C "$repo" commit -qm initial || return 1
+  git -C "$repo" -c protocol.file.allow=always submodule add -q "$source" modules/sub || return 1
+  output="$tmp/submodule.snapshot"
+  printf 'stale-success\n' >"$output"
+  assert_fails cccc_git_snapshot "$repo" "$output" || return 1
+  [ ! -e "$output" ] || {
+    test_diag 'failed submodule snapshot left a reusable output'
+    return 1
+  }
+}
+
+test_snapshot_rejects_untracked_nested_repository() {
+  local tmp repo nested output
+  tmp=$(new_test_dir) || return 1
+  repo="$tmp/parent-repo"
+  nested="$repo/nested"
+  init_test_repo "$repo" || return 1
+  init_test_repo "$nested" || return 1
+  printf 'nested\n' >"$nested/file"
+  git -C "$nested" add file || return 1
+  git -C "$nested" commit -qm initial || return 1
+  output="$tmp/nested.snapshot"
+  printf 'stale-success\n' >"$output"
+  assert_fails cccc_git_snapshot "$repo" "$output" || return 1
+  [ ! -e "$output" ] || {
+    test_diag 'failed nested-repo snapshot left a reusable output'
+    return 1
+  }
+}
+
 test_common_uses_bash_3_2_safe_constructs() {
   if grep -En '(^|[^[:alnum:]_])(eval|mapfile|readarray|declare[[:space:]]+-A|local[[:space:]]+-A)|\$\{[^}]*,,|nameref|declare[[:space:]]+-n' "$COMMON" >/dev/null; then
     test_diag 'common library contains a forbidden post-Bash-3.2 or string-eval construct'
@@ -636,6 +806,7 @@ run_test "timeout is canonical decimal" test_timeout_validation_is_decimal
 run_test "Python discovery verifies major version" test_python_discovery_checks_major_version
 run_test "Windows target resolution preserves argv boundaries" test_windows_target_resolution_preserves_argv
 run_test "Windows resolver rejects unsafe entries and preserves hostile argv" test_windows_target_resolution_rejects_unsafe_entries_and_preserves_hostile_args
+run_test "Windows resolver honors PATH precedence" test_windows_target_resolution_honors_path_precedence
 run_test "repository resolves physically and unborn HEAD is stable" test_repo_resolution_and_unborn_head
 run_test "symlinked workdir resolves to physical repository root" test_repo_resolution_follows_physical_worktree_path
 run_test "card path uses exact root and supports Unicode spaces" test_card_validation_exact_root_and_unicode
@@ -650,6 +821,8 @@ run_test "output symlink is refused" test_output_refuses_symlink
 run_test "output FIFO is refused" test_output_refuses_fifo
 run_test "allowed paths parse and match exact boundaries" test_allowed_paths_parse_and_match_exactly
 run_test "ambiguous allowed-path policy is rejected" test_allowed_paths_reject_ambiguous_policy
+run_test "allowed paths reject symlinks and invalid existing shapes" test_allowed_paths_reject_symlinks_and_invalid_existing_shapes
+run_test "return globals clear stale values before failures" test_return_globals_are_cleared_before_failure
 run_test "snapshot fingerprints Git-visible content only" test_snapshot_fingerprints_visible_content_and_ignores_ignored
 run_test "snapshot is NUL-safe for newline paths" test_snapshot_handles_newline_path
 run_test "snapshot detects index-only transition" test_snapshot_detects_index_only_transition
@@ -657,5 +830,7 @@ run_test "tracked FIFO snapshot is nonblocking" test_snapshot_tracked_fifo_is_no
 run_test "snapshot reports delete and rename paths" test_snapshot_detects_delete_and_rename_paths
 run_test "snapshot detects executable mode" test_snapshot_detects_executable_mode
 run_test "snapshot detects symlink target" test_snapshot_detects_symlink_target
+run_test "snapshot rejects a real submodule gitlink" test_snapshot_rejects_real_submodule_gitlink
+run_test "snapshot rejects an untracked nested repository" test_snapshot_rejects_untracked_nested_repository
 run_test "common library stays within Bash 3.2 syntax" test_common_uses_bash_3_2_safe_constructs
 finish_tests

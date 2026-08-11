@@ -325,6 +325,83 @@ class PublishNoClobberTests(unittest.TestCase):
         self.assertFalse(destination.exists())
         self.assert_no_temps()
 
+    def test_source_metadata_change_during_copy_is_not_published(self) -> None:
+        module = self.load_module()
+        source = self.root / "source"
+        destination = self.root / "destination"
+        source.write_bytes(b"original")
+        real_copy = module.shutil.copyfileobj
+
+        def copy_then_mutate(source_stream, destination_stream, *args, **kwargs):
+            result = real_copy(source_stream, destination_stream, *args, **kwargs)
+            with source.open("ab") as stream:
+                stream.write(b"-changed")
+                stream.flush()
+                os.fsync(stream.fileno())
+            return result
+
+        stderr = StringIO()
+        with redirect_stderr(stderr), mock.patch.object(
+            module.shutil, "copyfileobj", side_effect=copy_then_mutate
+        ):
+            result = module.main([str(source), str(destination)])
+
+        self.assertEqual(5, result)
+        self.assertFalse(os.path.lexists(destination))
+        self.assertIn("source", stderr.getvalue().lower())
+        self.assert_no_temps()
+
+    def test_source_path_inode_change_during_copy_is_not_published(self) -> None:
+        module = self.load_module()
+        source = self.root / "source"
+        moved = self.root / "moved-source"
+        destination = self.root / "destination"
+        source.write_bytes(b"original")
+        real_copy = module.shutil.copyfileobj
+
+        def copy_then_replace(source_stream, destination_stream, *args, **kwargs):
+            result = real_copy(source_stream, destination_stream, *args, **kwargs)
+            source.rename(moved)
+            source.write_bytes(b"replacement")
+            return result
+
+        stderr = StringIO()
+        with redirect_stderr(stderr), mock.patch.object(
+            module.shutil, "copyfileobj", side_effect=copy_then_replace
+        ):
+            result = module.main([str(source), str(destination)])
+
+        self.assertEqual(5, result)
+        self.assertFalse(os.path.lexists(destination))
+        self.assertEqual(b"original", moved.read_bytes())
+        self.assert_no_temps()
+
+    def test_primary_failure_also_warns_when_owned_temp_cleanup_fails(self) -> None:
+        module = self.load_module()
+        source = self.root / "source"
+        destination = self.root / "destination"
+        source.write_bytes(b"payload")
+        real_unlink = module.Path.unlink
+
+        def fail_owned_temp(path, *args, **kwargs):
+            if path.name.startswith(".cccc-publish-"):
+                raise PermissionError(errno.EACCES, "simulated cleanup denial")
+            return real_unlink(path, *args, **kwargs)
+
+        stderr = StringIO()
+        with redirect_stderr(stderr), mock.patch.object(
+            module.os, "link", side_effect=OSError(errno.EXDEV, "simulated link failure")
+        ), mock.patch.object(module.Path, "unlink", fail_owned_temp):
+            result = module.main([str(source), str(destination)])
+
+        self.assertEqual(5, result)
+        self.assertFalse(os.path.lexists(destination))
+        self.assertIn("hard-link publication", stderr.getvalue())
+        self.assertIn("warning", stderr.getvalue().lower())
+        leaked = list(self.root.glob(".cccc-publish-*"))
+        self.assertEqual(1, len(leaked))
+        leaked[0].unlink()
+
 
 if __name__ == "__main__":
     unittest.main()

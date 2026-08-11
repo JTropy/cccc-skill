@@ -20,7 +20,7 @@ class PublishError(Exception):
     """A safety check or atomic publication step failed."""
 
 
-def _open_verified_source(path: Path) -> int:
+def _open_verified_source(path: Path):
     try:
         before = os.lstat(path)
     except OSError as error:
@@ -45,7 +45,34 @@ def _open_verified_source(path: Path) -> int:
     except BaseException:
         os.close(descriptor)
         raise
-    return descriptor
+    return descriptor, opened
+
+
+def _verify_source_after_copy(path: Path, descriptor: int, opened_stat) -> None:
+    copied_stat = os.fstat(descriptor)
+    opened_metadata = (
+        opened_stat.st_size,
+        opened_stat.st_mtime_ns,
+        opened_stat.st_ctime_ns,
+    )
+    copied_metadata = (
+        copied_stat.st_size,
+        copied_stat.st_mtime_ns,
+        copied_stat.st_ctime_ns,
+    )
+    if opened_metadata != copied_metadata:
+        raise PublishError("source changed while being copied")
+    try:
+        current_path_stat = os.lstat(path)
+    except OSError as error:
+        raise PublishError(f"source path changed while being copied: {error}") from error
+    if stat.S_ISLNK(current_path_stat.st_mode) or not stat.S_ISREG(current_path_stat.st_mode):
+        raise PublishError("source path changed type while being copied")
+    if (current_path_stat.st_dev, current_path_stat.st_ino) != (
+        copied_stat.st_dev,
+        copied_stat.st_ino,
+    ):
+        raise PublishError("source path changed identity while being copied")
 
 
 def publish(source: Path, destination: Path) -> None:
@@ -63,7 +90,7 @@ def publish(source: Path, destination: Path) -> None:
     else:
         raise PublishError("destination already exists")
 
-    source_fd = _open_verified_source(source)
+    source_fd, source_opened_stat = _open_verified_source(source)
     temp_fd = None  # type: Optional[int]
     temp_path = None  # type: Optional[Path]
     cleanup_error = None  # type: Optional[OSError]
@@ -84,6 +111,7 @@ def publish(source: Path, destination: Path) -> None:
                 shutil.copyfileobj(source_stream, destination_stream)
                 destination_stream.flush()
                 os.fsync(destination_stream.fileno())
+                _verify_source_after_copy(source, source_stream.fileno(), source_opened_stat)
 
         try:
             os.link(temp_path, destination)
@@ -95,6 +123,7 @@ def publish(source: Path, destination: Path) -> None:
         except OSError as error:
             raise PublishError(f"atomic hard-link publication is unavailable: {error}") from error
     finally:
+        failure_in_progress = sys.exc_info()[0] is not None
         if source_fd >= 0:
             os.close(source_fd)
         if temp_fd is not None:
@@ -113,7 +142,13 @@ def publish(source: Path, destination: Path) -> None:
                     f"file cleanup failed: {cleanup_error}",
                     file=sys.stderr,
                 )
-            elif sys.exc_info()[0] is None:
+            elif failure_in_progress:
+                print(
+                    "cccc publish: warning: publication failed and owned temporary "
+                    f"file cleanup also failed: {cleanup_error}",
+                    file=sys.stderr,
+                )
+            else:
                 raise PublishError(f"cannot remove owned temporary file: {cleanup_error}")
 
 
