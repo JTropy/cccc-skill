@@ -1200,7 +1200,7 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
                     prefix,
                     str(len(arguments)),
                     digest,
-                    str(result_path),
+                    RUNNER_MODULE.windows_path_for_msys(str(result_path)),
                 ],
                 capture_output=True,
                 env=environment,
