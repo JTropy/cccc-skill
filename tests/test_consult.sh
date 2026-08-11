@@ -661,8 +661,8 @@ import sys
 text = open(sys.argv[1], encoding="utf-8").read()
 payload = text.split("mcp_content_begin\n", 1)[1].split("\nmcp_content_end", 1)[0]
 value = json.loads(payload)
-if value not in ({}, {"mcpServers": {}}):
-    raise SystemExit("MCP config is not semantically empty")
+if value != {"mcpServers": {}}:
+    raise SystemExit("MCP config is not the current Claude empty schema")
 PY
 }
 

@@ -793,7 +793,7 @@ cccc_consult_create_private_json() {
   "$CCCC_PYTHON" -I -c '
 import os, sys
 path = sys.argv[1]
-data = b"{}\n"
+data = b"{\"mcpServers\":{}}\n"
 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
 for name in ("O_NOFOLLOW", "O_CLOEXEC", "O_BINARY"):
     flags |= getattr(os, name, 0)
