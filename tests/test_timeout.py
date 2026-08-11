@@ -106,6 +106,19 @@ class TimeoutRunnerTests(unittest.TestCase):
             timeout=timeout,
         )
 
+    def run_runner_with_status(self, status_file, seconds, *program, timeout=10):
+        return subprocess.run(
+            command(
+                "--status-file", str(status_file), str(seconds), "--", *program
+            ),
+            capture_output=True,
+            timeout=timeout,
+        )
+
+    def assert_status(self, status_file, kind, value):
+        expected = f"cccc-timeout-result-v1 kind={kind} value={value}\n"
+        self.assertEqual(status_file.read_bytes(), expected.encode("ascii"))
+
     def test_rejects_bad_invocation(self):
         invalid = [
             [],
@@ -149,6 +162,124 @@ class TimeoutRunnerTests(unittest.TestCase):
         result = self.run_runner(2, *child("import sys; sys.exit(124)"))
         self.assertEqual(result.returncode, 124)
         self.assertNotIn(b"cccc-timeout:", result.stderr)
+
+    def test_status_file_distinguishes_natural_ambiguous_exit_codes(self):
+        for exit_code in (2, 124, 125, 127):
+            with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory() as directory:
+                status_file = Path(directory) / "status"
+                result = self.run_runner_with_status(
+                    status_file,
+                    2,
+                    *child(
+                        "import sys; "
+                        "print('cccc-timeout: command exceeded 2 seconds', file=sys.stderr); "
+                        f"sys.exit({exit_code})"
+                    ),
+                )
+
+                self.assertEqual(result.returncode, exit_code)
+                self.assert_status(status_file, "child-exit", exit_code)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal semantics")
+    def test_status_file_records_natural_child_signal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_file = Path(directory) / "status"
+            result = self.run_runner_with_status(
+                status_file,
+                2,
+                *child("import os, signal; os.kill(os.getpid(), signal.SIGTERM)"),
+            )
+
+            self.assertEqual(result.returncode, -signal.SIGTERM)
+            self.assert_status(status_file, "child-signal", signal.SIGTERM)
+
+    def test_status_file_distinguishes_wrapper_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_file = Path(directory) / "status"
+            result = self.run_runner_with_status(
+                status_file, 1, *child("import time; time.sleep(30)"), timeout=8
+            )
+
+            self.assertEqual(result.returncode, 124)
+            self.assert_status(status_file, "wrapper-timeout", "none")
+
+    def test_status_file_records_launch_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_file = Path(directory) / "status"
+            missing = str(Path(directory) / "missing-command")
+            result = self.run_runner_with_status(status_file, 2, missing)
+
+            self.assertEqual(result.returncode, 127)
+            self.assert_status(status_file, "launch-failure", "none")
+
+    def test_status_file_records_argument_validation_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_file = Path(directory) / "status"
+            result = subprocess.run(
+                command("--status-file", str(status_file), "bad", "--", *child("pass")),
+                capture_output=True,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assert_status(status_file, "argument-validation", "none")
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX file modes")
+    def test_status_file_is_private_and_not_inherited_by_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_file = Path(directory) / "status"
+            probe = (
+                "import os, sys; target = os.stat(sys.argv[1]); inherited = False;"
+                "\nfor fd in range(3, 256):"
+                "\n try: opened = os.fstat(fd)"
+                "\n except OSError: continue"
+                "\n if (opened.st_dev, opened.st_ino) == (target.st_dev, target.st_ino): inherited = True"
+                "\nsys.exit(99 if inherited else 0)"
+            )
+            result = self.run_runner_with_status(
+                status_file, 2, *child(probe), str(status_file)
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            self.assertEqual(status_file.stat().st_mode & 0o777, 0o600)
+            self.assert_status(status_file, "child-exit", 0)
+
+    def test_existing_status_target_prevents_child_launch_and_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_file = Path(directory) / "status"
+            sentinel = Path(directory) / "started"
+            status_file.write_text("owned", encoding="ascii")
+            result = self.run_runner_with_status(
+                status_file,
+                2,
+                *child("from pathlib import Path; import sys; Path(sys.argv[1]).touch()"),
+                str(sentinel),
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(status_file.read_text(encoding="ascii"), "owned")
+            self.assertFalse(sentinel.exists())
+            self.assertIn(b"status file", result.stderr)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX filesystem objects")
+    def test_symlink_and_fifo_status_targets_prevent_child_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            sentinel = directory / "started"
+            symlink = directory / "status-link"
+            symlink.symlink_to(directory / "missing-target")
+            fifo = directory / "status-fifo"
+            os.mkfifo(fifo)
+            for target in (symlink, fifo):
+                with self.subTest(target=target):
+                    result = self.run_runner_with_status(
+                        target,
+                        2,
+                        *child("from pathlib import Path; import sys; Path(sys.argv[1]).touch()"),
+                        str(sentinel),
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertFalse(sentinel.exists())
+                    self.assertIn(b"status file", result.stderr)
 
     def test_rejects_oversized_timeout_without_starting_command(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -334,6 +465,42 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         self.assertEqual(status, 125)
         self.assertIn("cleanup failed", stderr.getvalue())
         self.assertIn("signal mask", stderr.getvalue())
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal semantics")
+    def test_late_runner_signal_overrides_natural_child_125(self):
+        state = RUNNER_MODULE.InterruptState()
+        previous_handlers = {signal.SIGTERM: signal.SIG_DFL}
+        previous_mask = set()
+        process = mock.Mock()
+        process.pid = 4321
+
+        def natural_125_with_pending_signal(*_args, **_kwargs):
+            state.signum = signal.SIGTERM
+            return 125
+
+        process.wait.side_effect = natural_125_with_pending_signal
+        with tempfile.TemporaryDirectory() as directory:
+            status_file = Path(directory) / "status"
+            with mock.patch.object(
+                RUNNER_MODULE,
+                "install_interrupt_handlers",
+                return_value=(state, previous_handlers, previous_mask),
+            ), mock.patch.object(
+                RUNNER_MODULE, "restore_interrupt_handlers", return_value=None
+            ), mock.patch.object(
+                RUNNER_MODULE, "cleanup_posix_after_natural_exit", return_value=None
+            ), mock.patch.object(
+                RUNNER_MODULE.subprocess, "Popen", return_value=process
+            ):
+                status = RUNNER_MODULE.run(
+                    ["--status-file", str(status_file), "0", "--", "child"]
+                )
+
+            self.assertEqual(status, -signal.SIGTERM)
+            self.assertEqual(
+                status_file.read_text(encoding="ascii"),
+                f"cccc-timeout-result-v1 kind=runner-signal value={signal.SIGTERM}\n",
+            )
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX signal semantics")
     def test_signal_at_popen_boundary_is_cleaned_after_child_is_owned(self):
@@ -646,17 +813,25 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
 
     def test_windows_run_uses_explicit_bootstrap_setup_status(self):
         stderr = io.StringIO()
-        with mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
-             mock.patch.object(
-                 RUNNER_MODULE,
-                 "launch_windows_bootstrap",
-                 return_value=(None, None, None, "could not create bootstrap gate", 127),
-             ), \
-             mock.patch.object(RUNNER_MODULE.sys, "stderr", stderr):
-            status = RUNNER_MODULE.run(["1", "--", "target"])
+        with tempfile.TemporaryDirectory() as directory:
+            status_file = Path(directory) / "status"
+            with mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
+                 mock.patch.object(
+                     RUNNER_MODULE,
+                     "launch_windows_bootstrap",
+                     return_value=(None, None, None, "could not create bootstrap gate", 127),
+                 ), \
+                 mock.patch.object(RUNNER_MODULE.sys, "stderr", stderr):
+                status = RUNNER_MODULE.run(
+                    ["--status-file", str(status_file), "1", "--", "target"]
+                )
 
-        self.assertEqual(status, 127)
-        self.assertIn("could not create bootstrap gate", stderr.getvalue())
+            self.assertEqual(status, 127)
+            self.assertEqual(
+                status_file.read_text(encoding="ascii"),
+                "cccc-timeout-result-v1 kind=launch-failure value=none\n",
+            )
+            self.assertIn("could not create bootstrap gate", stderr.getvalue())
 
     def test_windows_bootstrap_parent_death_does_not_start_target(self):
         with mock.patch.object(RUNNER_MODULE, "wait_for_windows_bootstrap_gate", return_value="parent"), \
@@ -741,14 +916,44 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         process = mock.Mock()
         process.wait.side_effect = subprocess.TimeoutExpired(["child"], 1)
         stderr = io.StringIO()
-        with mock.patch.object(RUNNER_MODULE.subprocess, "Popen", return_value=process), \
-             mock.patch.object(RUNNER_MODULE, "stop_process", return_value="SIGTERM failed: denied"), \
-             mock.patch.object(RUNNER_MODULE.sys, "stderr", stderr):
-            status = RUNNER_MODULE.run(["1", "--", "child"])
+        with tempfile.TemporaryDirectory() as directory:
+            status_file = Path(directory) / "status"
+            with mock.patch.object(RUNNER_MODULE.subprocess, "Popen", return_value=process), \
+                 mock.patch.object(RUNNER_MODULE, "stop_process", return_value="SIGTERM failed: denied"), \
+                 mock.patch.object(RUNNER_MODULE.sys, "stderr", stderr):
+                status = RUNNER_MODULE.run(
+                    ["--status-file", str(status_file), "1", "--", "child"]
+                )
 
-        self.assertEqual(status, 125)
-        self.assertIn("cccc-timeout: command exceeded 1 seconds", stderr.getvalue())
-        self.assertIn("cccc-timeout: cleanup failed: SIGTERM failed: denied", stderr.getvalue())
+            self.assertEqual(status, 125)
+            self.assertEqual(
+                status_file.read_text(encoding="ascii"),
+                "cccc-timeout-result-v1 kind=cleanup-failure value=none\n",
+            )
+            self.assertIn("cccc-timeout: command exceeded 1 seconds", stderr.getvalue())
+            self.assertIn("cccc-timeout: cleanup failed: SIGTERM failed: denied", stderr.getvalue())
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_runner_internal_failure_is_recorded_and_child_is_cleaned(self):
+        process = mock.Mock()
+        process.wait.side_effect = RuntimeError("unexpected wait failure")
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            status_file = Path(directory) / "status"
+            with mock.patch.object(RUNNER_MODULE.subprocess, "Popen", return_value=process), \
+                 mock.patch.object(RUNNER_MODULE, "stop_process", return_value=None) as stop, \
+                 mock.patch.object(RUNNER_MODULE.sys, "stderr", stderr):
+                status = RUNNER_MODULE.run(
+                    ["--status-file", str(status_file), "1", "--", "child"]
+                )
+
+            self.assertEqual(status, 125)
+            self.assertEqual(
+                status_file.read_text(encoding="ascii"),
+                "cccc-timeout-result-v1 kind=runner-internal value=none\n",
+            )
+            self.assertIn("internal failure", stderr.getvalue())
+            stop.assert_called_once_with(process, None)
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
     def test_wait_overflow_returns_validation_error_after_cleanup(self):
@@ -858,6 +1063,55 @@ class PosixProcessGroupTests(unittest.TestCase):
         pids = self.run_tree(parent_ignores_term=True, grandchild_ignores_term=True)
         self.assertGreaterEqual(time.monotonic() - started, 2)
         self.assert_pids_gone(*pids)
+
+    def test_natural_exit_cleans_delayed_background_process_tree_before_return(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            status_file = directory / "status"
+            pid_file = directory / "pids"
+            sentinel = directory / "late-write"
+            leaf_code = (
+                "from pathlib import Path; import sys, time;"
+                "time.sleep(1); Path(sys.argv[1]).write_text('escaped'); time.sleep(30)"
+            )
+            middle_code = (
+                "from pathlib import Path; import os, subprocess, sys, time;"
+                f"leaf = subprocess.Popen([sys.executable, '-c', {leaf_code!r}, sys.argv[2]]);"
+                "Path(sys.argv[1]).write_text(f'{os.getpid()} {leaf.pid}');"
+                "time.sleep(30)"
+            )
+            parent_code = (
+                "from pathlib import Path; import subprocess, sys, time;"
+                f"subprocess.Popen([sys.executable, '-c', {middle_code!r}, sys.argv[1], sys.argv[2]]);"
+                "deadline = time.monotonic() + 2;"
+                "\nwhile not Path(sys.argv[1]).exists() and time.monotonic() < deadline: time.sleep(0.01)"
+                "\nif not Path(sys.argv[1]).exists(): sys.exit(98)"
+                "\nsys.exit(37)"
+            )
+
+            result = subprocess.run(
+                command(
+                    "--status-file",
+                    str(status_file),
+                    "5",
+                    "--",
+                    *child(parent_code),
+                    str(pid_file),
+                    str(sentinel),
+                ),
+                capture_output=True,
+                timeout=8,
+            )
+
+            self.assertEqual(result.returncode, 37, result.stderr.decode(errors="replace"))
+            self.assertEqual(
+                status_file.read_text(encoding="ascii"),
+                "cccc-timeout-result-v1 kind=child-exit value=37\n",
+            )
+            descendants = tuple(map(int, pid_file.read_text().split()))
+            self.assert_pids_gone(*descendants)
+            time.sleep(1.2)
+            self.assertFalse(sentinel.exists())
 
     def test_runner_interrupt_cleans_descendants_and_preserves_signal(self):
         child_code = (

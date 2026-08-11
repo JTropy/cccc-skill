@@ -10,12 +10,16 @@ import time
 import uuid
 
 
-USAGE = "usage: run-with-timeout.py SECONDS -- COMMAND [ARG ...]"
+USAGE = (
+    "usage: run-with-timeout.py [--status-file ABSENT_PRIVATE_PATH] "
+    "SECONDS -- COMMAND [ARG ...]"
+)
 CLEANUP_GRACE_SECONDS = 2
 POLL_INTERVAL_SECONDS = 0.05
 # Keep the timeout safely representable as milliseconds on every supported platform.
 MAX_TIMEOUT_SECONDS = min(sys.maxsize // 1000, (2**31 - 1) // 1000)
 WINDOWS_BOOTSTRAP_WAIT_MS = 10_000
+STATUS_VERSION = "cccc-timeout-result-v1"
 
 
 class RunnerInterrupted(Exception):
@@ -41,6 +45,78 @@ def fail(message):
 def cleanup_failed(message):
     print(f"cccc-timeout: cleanup failed: {message}", file=sys.stderr)
     return 125
+
+
+class StatusFile:
+    """A runner-owned, non-inherited file for one trusted outcome record."""
+
+    def __init__(self, fd):
+        self.fd = fd
+
+    def write(self, kind, value=None):
+        try:
+            value_text = "none" if value is None else str(int(value))
+            record = (
+                f"{STATUS_VERSION} kind={kind} value={value_text}\n".encode("ascii")
+            )
+            offset = 0
+            while offset < len(record):
+                written = os.write(self.fd, record[offset:])
+                if written <= 0:
+                    raise OSError("status file write made no progress")
+                offset += written
+            os.fsync(self.fd)
+        except OSError as exc:
+            close_error = self.close()
+            return join_cleanup_errors(f"could not persist status file: {exc}", close_error)
+        return self.close()
+
+    def close(self):
+        if self.fd is None:
+            return None
+        fd, self.fd = self.fd, None
+        try:
+            os.close(fd)
+        except OSError as exc:
+            return f"could not close status file: {exc}"
+        return None
+
+
+def create_status_file(path):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    for optional_flag in ("O_NOFOLLOW", "O_CLOEXEC", "O_BINARY"):
+        flags |= getattr(os, optional_flag, 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+        os.set_inheritable(fd, False)
+        if os.name == "posix":
+            os.fchmod(fd, 0o600)
+    except (OSError, TypeError, ValueError) as exc:
+        if "fd" in locals():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        print(f"cccc-timeout: cannot create status file safely: {exc}", file=sys.stderr)
+        return None
+    return StatusFile(fd)
+
+
+def parse_status_option(argv):
+    if not argv or argv[0] != "--status-file":
+        return None, argv, None
+    if len(argv) < 2 or not argv[1]:
+        return None, argv, fail(USAGE)
+    return argv[1], argv[2:], None
+
+
+def finish_with_status(status_file, result, kind, value=None):
+    if status_file is None:
+        return result
+    error = status_file.write(kind, value)
+    if error:
+        return cleanup_failed(error)
+    return result
 
 
 def parse_arguments(argv):
@@ -144,6 +220,14 @@ def stop_posix(process):
     except OSError as exc:
         return join_cleanup_errors(f"SIGKILL failed: {exc}", bounded_reap(process))
     return confirm_posix_post_kill(process, process_group)
+
+
+def cleanup_posix_after_natural_exit(process):
+    """Remove any descendants left in the child's original process group."""
+    process_group = process.pid
+    if not isinstance(process_group, int) or not process_group_exists(process_group):
+        return None
+    return stop_posix(process)
 
 
 class WindowsJob:
@@ -483,9 +567,18 @@ def run_windows_bootstrap(event_name, parent_pid, command):
 
 
 def run(argv):
+    status_path, argv, option_error = parse_status_option(argv)
+    if option_error is not None:
+        return option_error
+    status_file = create_status_file(status_path) if status_path is not None else None
+    if status_path is not None and status_file is None:
+        return 2
+
     seconds, command, error = parse_arguments(argv)
     if error is not None:
-        return error
+        return finish_with_status(
+            status_file, error, "argument-validation"
+        )
 
     options = {}
     if os.name == "posix":
@@ -497,6 +590,8 @@ def run(argv):
     job = None
     gate = None
     result = None
+    result_kind = "runner-internal"
+    result_value = None
     process = None
     if os.name == "posix":
         try:
@@ -504,7 +599,8 @@ def run(argv):
                 install_interrupt_handlers()
             )
         except (OSError, RuntimeError, ValueError) as exc:
-            return cleanup_failed(f"could not install interrupt handlers: {exc}")
+            result = cleanup_failed(f"could not install interrupt handlers: {exc}")
+            return finish_with_status(status_file, result, result_kind)
     try:
         try:
             if interrupt_state is not None and interrupt_state.signum is not None:
@@ -514,9 +610,11 @@ def run(argv):
                 if error:
                     if error_status == 125:
                         result = cleanup_failed(error)
+                        result_kind = "cleanup-failure"
                     else:
                         print(f"cccc-timeout: {error}", file=sys.stderr)
                         result = error_status
+                        result_kind = "launch-failure"
             else:
                 process = subprocess.Popen(command, **options)
             if interrupt_state is not None:
@@ -525,6 +623,20 @@ def run(argv):
                     raise RunnerInterrupted(interrupt_state.signum)
             if result is None:
                 result = process.wait() if seconds == 0 else process.wait(timeout=seconds)
+                if os.name == "posix":
+                    cleanup_error = cleanup_posix_after_natural_exit(process)
+                    if cleanup_error:
+                        result = cleanup_failed(cleanup_error)
+                        result_kind = "cleanup-failure"
+                    elif result < 0:
+                        result_kind = "child-signal"
+                        result_value = -result
+                    else:
+                        result_kind = "child-exit"
+                        result_value = result
+                else:
+                    result_kind = "child-exit"
+                    result_value = result
             if interrupt_state is not None:
                 interrupt_state.process = None
         except subprocess.TimeoutExpired:
@@ -532,26 +644,42 @@ def run(argv):
             if interrupt_state is not None:
                 interrupt_state.process = None
             error = stop_process(process, job)
-            result = cleanup_failed(error) if error else 124
+            if error:
+                result = cleanup_failed(error)
+                result_kind = "cleanup-failure"
+            else:
+                result = 124
+                result_kind = "wrapper-timeout"
         except OverflowError:
             if interrupt_state is not None:
                 interrupt_state.process = None
             error = stop_process(process, job)
             if error:
                 result = cleanup_failed(error)
+                result_kind = "cleanup-failure"
             else:
                 result = fail(f"seconds must be no greater than {MAX_TIMEOUT_SECONDS}")
+                result_kind = "argument-validation"
         except RunnerInterrupted as interrupted:
             interrupt_state.process = None
             error = stop_process(process, job) if process is not None else None
-            result = cleanup_failed(error) if error else -interrupted.signum
+            if error:
+                result = cleanup_failed(error)
+                result_kind = "cleanup-failure"
+            else:
+                result = -interrupted.signum
+                result_kind = "runner-signal"
+                result_value = interrupted.signum
         except OSError as exc:
             if process is None:
                 if interrupt_state is not None and interrupt_state.signum is not None:
                     result = -interrupt_state.signum
+                    result_kind = "runner-signal"
+                    result_value = interrupt_state.signum
                 else:
                     print(f"cccc-timeout: cannot start command: {exc}", file=sys.stderr)
                     result = 127
+                    result_kind = "launch-failure"
             else:
                 if interrupt_state is not None:
                     interrupt_state.process = None
@@ -559,6 +687,22 @@ def run(argv):
                 result = cleanup_failed(
                     join_cleanup_errors(f"process lifecycle failed: {exc}", cleanup_error)
                 )
+                result_kind = "cleanup-failure"
+                result_value = None
+        except Exception as exc:
+            if interrupt_state is not None:
+                interrupt_state.process = None
+            cleanup_error = stop_process(process, job) if process is not None else None
+            if cleanup_error:
+                result = cleanup_failed(
+                    join_cleanup_errors(f"internal failure: {exc}", cleanup_error)
+                )
+                result_kind = "cleanup-failure"
+            else:
+                print(f"cccc-timeout: internal failure: {exc}", file=sys.stderr)
+                result = 125
+                result_kind = "runner-internal"
+            result_value = None
     finally:
         if interrupt_state is not None:
             interrupt_state.process = None
@@ -568,17 +712,28 @@ def run(argv):
             )
             if restore_error:
                 result = cleanup_failed(restore_error)
-            elif interrupt_state.signum is not None and result != 125:
+                result_kind = "cleanup-failure"
+                result_value = None
+            elif (
+                interrupt_state.signum is not None
+                and result_kind != "cleanup-failure"
+            ):
                 result = -interrupt_state.signum
+                result_kind = "runner-signal"
+                result_value = interrupt_state.signum
         if job is not None:
             close_error = job.close()
             if close_error:
                 result = cleanup_failed(close_error)
+                result_kind = "cleanup-failure"
+                result_value = None
         if gate is not None:
             close_error = gate.close()
             if close_error:
                 result = cleanup_failed(close_error)
-    return result
+                result_kind = "cleanup-failure"
+                result_value = None
+    return finish_with_status(status_file, result, result_kind, result_value)
 
 
 def main():
