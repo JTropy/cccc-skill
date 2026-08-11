@@ -99,6 +99,78 @@ class ValidateSkillTests(unittest.TestCase):
             )
             self.assertIn("1..1024", "\n".join(self.validate(skill_path)))
 
+    def test_accepts_description_at_exact_length_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            shortest = self.make_skill(
+                root / "shortest",
+                frontmatter="---\nname: cccc\ndescription: x\n---\n",
+            )
+            longest = self.make_skill(
+                root / "longest",
+                directory="cccc-longest",
+                frontmatter=(
+                    "---\nname: cccc-longest\ndescription: " + "x" * 1024 + "\n---\n"
+                ),
+            )
+            self.assertEqual([], self.validate(shortest))
+            self.assertEqual([], self.validate(longest))
+
+    def test_rejects_non_string_frontmatter_scalars(self) -> None:
+        invalid_values = ("null", "true", "[cccc]", "{name: cccc}", "|", "&alias cccc")
+        for field in ("name", "description"):
+            for value in invalid_values:
+                with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as temp_dir:
+                    other_field = "description: Valid description" if field == "name" else "name: cccc"
+                    skill_path = self.make_skill(
+                        Path(temp_dir),
+                        frontmatter=f"---\n{other_field}\n{field}: {value}\n---\n",
+                    )
+                    self.assertIn("single-line string scalar", "\n".join(self.validate(skill_path)))
+
+    def test_rejects_malformed_quoted_frontmatter_scalar(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_path = self.make_skill(
+                Path(temp_dir),
+                frontmatter='---\nname: cccc\ndescription: "unclosed\n---\n',
+            )
+            self.assertIn("single-line string scalar", "\n".join(self.validate(skill_path)))
+
+    def test_rejects_non_string_interface_scalars(self) -> None:
+        for field, value in (
+            ("display_name", "true"),
+            ("short_description", "[Route work]"),
+            ("default_prompt", "!tag route"),
+        ):
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as temp_dir:
+                interface_values = {
+                    "display_name": "cccc",
+                    "short_description": "Route work",
+                    "default_prompt": "Use $cccc to route this task.",
+                }
+                interface_values[field] = value
+                skill_path = self.make_skill(
+                    Path(temp_dir),
+                    openai_yaml=(
+                        "interface:\n"
+                        f"  display_name: {interface_values['display_name']}\n"
+                        f"  short_description: {interface_values['short_description']}\n"
+                        f"  default_prompt: {interface_values['default_prompt']}\n"
+                    ),
+                )
+                self.assertIn("single-line string scalar", "\n".join(self.validate(skill_path)))
+
+    def test_accepts_nested_metadata_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_path = self.make_skill(
+                Path(temp_dir),
+                frontmatter=(
+                    "---\nname: cccc\ndescription: Valid description\nmetadata:\n"
+                    "  private_key: allowed-as-metadata\n---\n"
+                ),
+            )
+            self.assertEqual([], self.validate(skill_path))
+
     def test_rejects_unresolved_relative_markdown_link(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skill_path = self.make_skill(Path(temp_dir), body="[missing](missing.md)\n")
@@ -108,6 +180,52 @@ class ValidateSkillTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             skill_path = self.make_skill(Path(temp_dir), body="[outside](../outside.md)\n")
             self.assertIn("escapes skill root", "\n".join(self.validate(skill_path)))
+
+    def test_accepts_local_markdown_links_with_titles_parentheses_and_anchors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_path = self.make_skill(
+                Path(temp_dir),
+                body=(
+                    '[titled](guide.md "A guide")\n'
+                    '[parenthesized](reference (v2).md)\n'
+                    '[anchor](guide.md#section)\n'
+                ),
+            )
+            (skill_path / "guide.md").write_text("# Guide\n", encoding="utf-8")
+            (skill_path / "reference (v2).md").write_text("# Reference\n", encoding="utf-8")
+            self.assertEqual([], self.validate(skill_path))
+
+    def test_ignores_arbitrary_external_markdown_uri_schemes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_path = self.make_skill(
+                Path(temp_dir),
+                body=(
+                    "[ftp](ftp://example.com/skill)\n"
+                    "[custom](peer+agent://example/task)\n"
+                    "[protocol-relative](//cdn.example.com/skill)\n"
+                ),
+            )
+            self.assertEqual([], self.validate(skill_path))
+
+    def test_reports_invalid_utf8_in_skill_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_path = self.make_skill(Path(temp_dir))
+            (skill_path / "SKILL.md").write_bytes(b"\xff")
+            self.assertIn("cannot read SKILL.md", "\n".join(self.validate(skill_path)))
+
+    def test_reports_invalid_utf8_in_referenced_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_path = self.make_skill(Path(temp_dir), body="[notes](notes.md)\n")
+            (skill_path / "notes.md").write_bytes(b"\xff")
+            self.assertIn("cannot read notes.md", "\n".join(self.validate(skill_path)))
+
+    def test_reports_invalid_utf8_in_openai_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_path = self.make_skill(Path(temp_dir))
+            (skill_path / "agents" / "openai.yaml").write_bytes(b"\xff")
+            self.assertIn(
+                "cannot read agents/openai.yaml", "\n".join(self.validate(skill_path))
+            )
 
     def test_rejects_missing_default_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
