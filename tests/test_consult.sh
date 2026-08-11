@@ -78,6 +78,9 @@ trap 'test_signal_cleanup 15' TERM
 
 run_test() {
   local name=$1 function_name=$2 output_file rc_file test_pid attempts output rc
+  if [ -n "${CCCC_TEST_FILTER-}" ]; then
+    case "$name" in *"$CCCC_TEST_FILTER"*) ;; *) return 0 ;; esac
+  fi
   TEST_COUNT=$((TEST_COUNT + 1))
   output_file="$TEST_TMP_ROOT/consult-case-$TEST_COUNT.output"
   rc_file="$TEST_TMP_ROOT/consult-case-$TEST_COUNT.rc"
@@ -323,6 +326,28 @@ wait_for_ready_count() {
     attempts=$((attempts + 1))
   done
   return 1
+}
+
+publication_ready_pid() {
+  local directory=$1 ready pid
+  for ready in "$directory"/ready.*; do
+    [ -f "$ready" ] || continue
+    pid=${ready##*.}
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    printf '%s\n' "$pid"
+    return 0
+  done
+  return 1
+}
+
+assert_publication_helper_gone() {
+  local pid=$1 barrier=$2 label=$3
+  if kill -0 "$pid" 2>/dev/null; then
+    : >"$barrier/release"
+    terminate_external_pid "$pid" || true
+    test_diag "$label publisher shim survived wrapper signal cleanup"
+    return 1
+  fi
 }
 
 wait_pid_bounded() {
@@ -1779,10 +1804,9 @@ destination=
 previous=
 second_last=
 last=
+case ${2-} in */publish-no-clobber.py) is_publish=1 ;; esac
 for argument in "$@"; do
-  case "$argument" in */publish-no-clobber.py) is_publish=1 ;;
-    --print-parent-identity) is_parent_identity=1 ;;
-  esac
+  case "$argument" in --print-parent-identity) is_parent_identity=1 ;; esac
   second_last=$last
   last=$argument
 done
@@ -1843,6 +1867,278 @@ exec "$CCCC_REAL_PYTHON" "$@"
 PUBLISH_SHIM
   chmod +x "$CASE_BIN/python3" || return 1
   CCCC_REAL_PYTHON=$real_python
+}
+
+install_publication_signal_python() {
+  local real_python=$1
+  cat >"$CASE_BIN/python3" <<'PUBLISH_SIGNAL_SHIM'
+#!/usr/bin/env bash
+is_publish=0
+is_parent_identity=0
+second_last=
+last=
+case ${2-} in */publish-no-clobber.py) is_publish=1 ;; esac
+for argument in "$@"; do
+  case "$argument" in --print-parent-identity) is_parent_identity=1 ;; esac
+  second_last=$last
+  last=$argument
+done
+if [ "$is_publish" -eq 1 ] && [ "$is_parent_identity" -eq 0 ] &&
+  [ -n "${CCCC_PUBLISH_SIGNAL_BARRIER-}" ]; then
+  publication_signal_barrier() {
+    mkdir -p "$CCCC_PUBLISH_SIGNAL_BARRIER" || exit 97
+    printf 'ready\n' >"$CCCC_PUBLISH_SIGNAL_BARRIER/ready.$$" || exit 97
+    attempts=${CCCC_PUBLISH_SIGNAL_TICKS:-1500}
+    while [ ! -e "$CCCC_PUBLISH_SIGNAL_BARRIER/release" ] && [ "$attempts" -gt 0 ]; do
+      sleep 0.02
+      attempts=$((attempts - 1))
+    done
+    [ -e "$CCCC_PUBLISH_SIGNAL_BARRIER/release" ] || exit 98
+  }
+  case "${CCCC_PUBLISH_SIGNAL_PHASE-before-log}:${second_last##*/}" in
+    before-log:consult.log)
+      publication_signal_barrier
+      ;;
+    after-log:consult.log|after-opinion:opinion.md)
+      "$CCCC_REAL_PYTHON" "$@"
+      rc=$?
+      [ "$rc" -eq 0 ] || exit "$rc"
+      publication_signal_barrier
+      exit 0
+      ;;
+  esac
+fi
+exec "$CCCC_REAL_PYTHON" "$@"
+PUBLISH_SIGNAL_SHIM
+  chmod +x "$CASE_BIN/python3" || return 1
+}
+
+test_signal_before_log_publication_commits_no_output() {
+  local real_python barrier wrapper_pid publisher_pid attempts rc common lock launcher_python signal expected
+  require_posix_inode_capability || return 77
+  require_consult || return 1
+  real_python=$(command -v python3) || return 1
+  launcher_python=$real_python
+  for signal in HUP INT TERM; do
+    case "$signal" in HUP) expected=129 ;; INT) expected=130 ;; TERM) expected=143 ;; esac
+    prepare_case || return 1
+    install_publication_signal_python "$real_python" || return 1
+    barrier="$CASE_DIR/publication-signal-barrier"
+    mkdir -p "$barrier" || return 1
+    (
+      export PATH="$CASE_BIN:$ORIGINAL_PATH" TMPDIR="$CASE_TMP"
+      export CCCC_REAL_PYTHON="$real_python" CCCC_PUBLISH_SIGNAL_BARRIER="$barrier"
+      export CCCC_PUBLISH_SIGNAL_PHASE=before-log
+      export CCCC_FAKE_ARGV_FILE="$CASE_ARGV" CCCC_FAKE_ENV_FILE="$CASE_ENV"
+      export CCCC_FAKE_CWD_FILE="$CASE_CWD" CCCC_FAKE_PRIVATE_FILE="$CASE_PRIVATE"
+      export CCCC_FAKE_CALLS_FILE="$CASE_CALLS" CCCC_FAKE_LAUNCH_FILE="$CASE_LAUNCH"
+      export CCCC_FAKE_REPO="$CASE_REPO" CCCC_FAKE_CARD="$CASE_CARD"
+      export CCCC_AUTH_STATUS_HELPER="$AUTH_STATUS_HELPER"
+      exec_consult_with_signal_defaults "$launcher_python" claude "$CASE_CARD" "$CASE_REPO"
+    ) >"$CASE_DIR/publication-signal-output" 2>&1 & wrapper_pid=$!
+    if ! wait_for_ready_count "$barrier" 1; then
+      : >"$barrier/release"
+      terminate_and_reap_pid "$wrapper_pid" || true
+      test_diag 'log publisher never reached the pre-commit barrier'
+      return 1
+    fi
+    publisher_pid=$(publication_ready_pid "$barrier") || {
+      : >"$barrier/release"
+      terminate_and_reap_pid "$wrapper_pid" || true
+      test_diag 'cannot identify the pre-commit publisher shim PID'
+      return 1
+    }
+    kill -s "$signal" "$wrapper_pid" || {
+      : >"$barrier/release"
+      terminate_and_reap_pid "$wrapper_pid" || true
+      return 1
+    }
+    attempts=250
+    while kill -0 "$wrapper_pid" 2>/dev/null && [ "$attempts" -gt 0 ]; do
+      sleep 0.02
+      attempts=$((attempts - 1))
+    done
+    if kill -0 "$wrapper_pid" 2>/dev/null; then
+      : >"$barrier/release"
+      terminate_and_reap_pid "$wrapper_pid" || true
+      test_diag "pre-commit publication $signal did not terminate the publisher tree"
+      return 1
+    fi
+    if wait "$wrapper_pid"; then rc=0; else rc=$?; fi
+    assert_publication_helper_gone "$publisher_pid" "$barrier" "pre-commit publication $signal" || return 1
+    assert_eq "$expected" "$rc" "pre-commit publication $signal status" || return 1
+    [ ! -e "$(log_path claude "$CASE_CARD")" ] || return 1
+    [ ! -e "$(opinion_path claude "$CASE_CARD")" ] || return 1
+    common=$(git -C "$CASE_REPO" rev-parse --path-format=absolute --git-common-dir) || return 1
+    lock="$common/cccc-v2.lock"
+    [ ! -e "$lock" ] || return 1
+    CCCC_REAL_PYTHON="$real_python" run_consult claude
+    assert_success_outputs claude || return 1
+  done
+}
+
+test_signal_after_publication_commit_reports_partial_outputs() {
+  local real_python launcher_python phase barrier wrapper_pid publisher_pid attempts rc output log log_physical opinion common lock
+  require_posix_inode_capability || return 77
+  require_consult || return 1
+  real_python=$(command -v python3) || return 1
+  launcher_python=$real_python
+  for phase in after-log after-opinion; do
+    prepare_case || return 1
+    install_publication_signal_python "$real_python" || return 1
+    barrier="$CASE_DIR/publication-signal-barrier"
+    mkdir -p "$barrier" || return 1
+    output="$CASE_DIR/publication-signal-output"
+    log=$(log_path claude "$CASE_CARD")
+    log_physical=$(CDPATH= cd -P -- "$(dirname -- "$log")" && printf '%s/%s\n' "$PWD" "${log##*/}") || return 1
+    opinion=$(opinion_path claude "$CASE_CARD")
+    (
+      export PATH="$CASE_BIN:$ORIGINAL_PATH" TMPDIR="$CASE_TMP"
+      export CCCC_REAL_PYTHON="$real_python" CCCC_PUBLISH_SIGNAL_BARRIER="$barrier"
+      export CCCC_PUBLISH_SIGNAL_PHASE="$phase"
+      export CCCC_FAKE_ARGV_FILE="$CASE_ARGV" CCCC_FAKE_ENV_FILE="$CASE_ENV"
+      export CCCC_FAKE_CWD_FILE="$CASE_CWD" CCCC_FAKE_PRIVATE_FILE="$CASE_PRIVATE"
+      export CCCC_FAKE_CALLS_FILE="$CASE_CALLS" CCCC_FAKE_LAUNCH_FILE="$CASE_LAUNCH"
+      export CCCC_FAKE_REPO="$CASE_REPO" CCCC_FAKE_CARD="$CASE_CARD"
+      export CCCC_AUTH_STATUS_HELPER="$AUTH_STATUS_HELPER"
+      exec_consult_with_signal_defaults "$launcher_python" claude "$CASE_CARD" "$CASE_REPO"
+    ) >"$output" 2>&1 & wrapper_pid=$!
+    if ! wait_for_ready_count "$barrier" 1; then
+      : >"$barrier/release"
+      terminate_and_reap_pid "$wrapper_pid" || true
+      test_diag "$phase publisher never reached its post-commit barrier"
+      return 1
+    fi
+    publisher_pid=$(publication_ready_pid "$barrier") || {
+      : >"$barrier/release"
+      terminate_and_reap_pid "$wrapper_pid" || true
+      test_diag "cannot identify the $phase publisher shim PID"
+      return 1
+    }
+    [ -s "$log" ] || {
+      : >"$barrier/release"
+      terminate_and_reap_pid "$wrapper_pid" || true
+      test_diag "$phase did not commit the log before its barrier"
+      return 1
+    }
+    if [ "$phase" = after-log ]; then
+      [ ! -e "$opinion" ] || {
+        : >"$barrier/release"
+        terminate_and_reap_pid "$wrapper_pid" || true
+        return 1
+      }
+    else
+      [ -s "$opinion" ] || {
+        : >"$barrier/release"
+        terminate_and_reap_pid "$wrapper_pid" || true
+        test_diag 'opinion was not committed before the after-opinion barrier'
+        return 1
+      }
+    fi
+    kill -HUP "$wrapper_pid" || {
+      : >"$barrier/release"
+      terminate_and_reap_pid "$wrapper_pid" || true
+      return 1
+    }
+    attempts=250
+    while kill -0 "$wrapper_pid" 2>/dev/null && [ "$attempts" -gt 0 ]; do
+      sleep 0.02
+      attempts=$((attempts - 1))
+    done
+    if kill -0 "$wrapper_pid" 2>/dev/null; then
+      : >"$barrier/release"
+      terminate_and_reap_pid "$wrapper_pid" || true
+      test_diag "$phase publication signal exceeded bounded wait"
+      return 1
+    fi
+    if wait "$wrapper_pid"; then rc=0; else rc=$?; fi
+    assert_publication_helper_gone "$publisher_pid" "$barrier" "$phase publication" || return 1
+    assert_eq 129 "$rc" "$phase publication HUP status" || return 1
+    case "$(cat "$output")" in
+      *"$log_physical"*manual*cleanup*|*manual*cleanup*"$log_physical"*) ;;
+      *) test_diag "$phase lacks an exact manual-cleanup diagnostic: $(cat "$output")"; return 1 ;;
+    esac
+    case "$(cat "$output")" in *'cccc: consult opinion:'*|*'cccc: consult log:'*) return 1 ;; esac
+    [ -s "$log" ] || return 1
+    if [ "$phase" = after-log ]; then [ ! -e "$opinion" ] || return 1; else [ -s "$opinion" ] || return 1; fi
+    common=$(git -C "$CASE_REPO" rev-parse --path-format=absolute --git-common-dir) || return 1
+    lock="$common/cccc-v2.lock"
+    [ ! -e "$lock" ] || return 1
+  done
+}
+
+test_signal_before_success_reporting_has_no_partial_success_lines() {
+  local injected script_dir real_python launcher_python wrapper_pid attempts rc output log opinion common lock
+  require_posix_inode_capability || return 77
+  require_consult || return 1
+  prepare_case || return 1
+  injected="$CASE_DIR/consult-success-window.sh"
+  script_dir=$(dirname -- "$CONSULT")
+  real_python=$(command -v python3) || return 1
+  launcher_python=$real_python
+  python3 -I - "$CONSULT" "$injected" "$script_dir" <<'PY'
+import shlex
+import sys
+
+source_path, output_path, script_dir = sys.argv[1:]
+source = open(source_path, encoding="utf-8").read()
+script_line = 'SCRIPT_DIR=$(CDPATH= cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || exit 127'
+if script_line not in source:
+    raise SystemExit("consult SCRIPT_DIR line changed")
+source = source.replace(script_line, "SCRIPT_DIR=" + shlex.quote(script_dir), 1)
+needle = """  trap '' HUP INT TERM
+  printf 'cccc: consult opinion: %s\\ncccc: consult log: %s\\n' \\
+    \"$opinion_destination\" \"$log_destination\"
+"""
+if needle not in source:
+    raise SystemExit("consult success reporting is not one signal-atomic printf")
+injection = """  printf 'fired\\n' >\"$CCCC_SUCCESS_WINDOW_MARKER\"
+  kill -HUP \"$$\"
+  sleep 0.2
+"""
+with open(output_path, "x", encoding="utf-8") as stream:
+    stream.write(source.replace(needle, injection + needle, 1))
+PY
+  [ "$?" -eq 0 ] || return 1
+  chmod +x "$injected" || return 1
+  output="$CASE_DIR/success-window-output"
+  log=$(log_path claude "$CASE_CARD")
+  opinion=$(opinion_path claude "$CASE_CARD")
+  (
+    export PATH="$CASE_BIN:$ORIGINAL_PATH" TMPDIR="$CASE_TMP"
+    export CCCC_SUCCESS_WINDOW_MARKER="$CASE_DIR/success-window-fired"
+    export CCCC_FAKE_ARGV_FILE="$CASE_ARGV" CCCC_FAKE_ENV_FILE="$CASE_ENV"
+    export CCCC_FAKE_CWD_FILE="$CASE_CWD" CCCC_FAKE_PRIVATE_FILE="$CASE_PRIVATE"
+    export CCCC_FAKE_CALLS_FILE="$CASE_CALLS" CCCC_FAKE_LAUNCH_FILE="$CASE_LAUNCH"
+    export CCCC_FAKE_REPO="$CASE_REPO" CCCC_FAKE_CARD="$CASE_CARD"
+    export CCCC_AUTH_STATUS_HELPER="$AUTH_STATUS_HELPER"
+    CONSULT="$injected" exec_consult_with_signal_defaults \
+      "$launcher_python" claude "$CASE_CARD" "$CASE_REPO"
+  ) >"$output" 2>&1 & wrapper_pid=$!
+  attempts=500
+  while kill -0 "$wrapper_pid" 2>/dev/null && [ "$attempts" -gt 0 ]; do
+    sleep 0.02
+    attempts=$((attempts - 1))
+  done
+  if kill -0 "$wrapper_pid" 2>/dev/null; then
+    terminate_and_reap_pid "$wrapper_pid" || true
+    test_diag 'pre-success signal invocation exceeded bounded wait'
+    return 1
+  fi
+  if wait "$wrapper_pid"; then rc=0; else rc=$?; fi
+  [ -s "$CASE_DIR/success-window-fired" ] || return 1
+  assert_eq 129 "$rc" 'pre-success reporting HUP status' || return 1
+  [ -s "$log" ] && [ -s "$opinion" ] || return 1
+  case "$(cat "$output")" in *'cccc: consult opinion:'*|*'cccc: consult log:'*)
+    test_diag 'pre-success signal emitted a partial success line'
+    return 1
+  esac
+  case "$(cat "$output")" in *manual*cleanup*|*manual*cleanup*verification*) ;;
+    *) test_diag 'pre-success signal lacks committed-output recovery guidance'; return 1 ;;
+  esac
+  common=$(git -C "$CASE_REPO" rev-parse --path-format=absolute --git-common-dir) || return 1
+  lock="$common/cccc-v2.lock"
+  [ ! -e "$lock" ]
 }
 
 test_publication_binds_source_digest_parent_identity_and_orders_log_first() {
@@ -2049,6 +2345,9 @@ run_test 'different repositories run concurrently' test_different_repositories_c
 run_test 'stale symlink FIFO outputs never clobber' test_stale_symlink_fifo_outputs_are_bounded_and_never_clobbered
 run_test 'target outputs and dirty gate preserve first' test_target_outputs_do_not_conflict_and_second_run_obeys_dirty_gate
 run_test 'publication binds source parent and order' test_publication_binds_source_digest_parent_identity_and_orders_log_first
+run_test 'pre-commit publication signal leaves no output' test_signal_before_log_publication_commits_no_output
+run_test 'post-commit publication signal reports partial outputs' test_signal_after_publication_commit_reports_partial_outputs
+run_test 'pre-success signal emits no partial success' test_signal_before_success_reporting_has_no_partial_success_lines
 run_test 'run dirs private and Git non-destructive' test_run_directories_are_private_and_git_operations_are_non_destructive
 run_test 'Windows native execution or explicit skip' test_windows_native_execution_or_explicit_platform_skip
 

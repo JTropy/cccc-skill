@@ -20,6 +20,10 @@ RUNNER_TOKEN_PATH=
 RUNNER_SECRET_HEX=
 PENDING_SIGNAL_NUMBER=
 PENDING_SIGNAL_NAME=
+ACTIVE_HELPER_PID=
+PUBLICATION_PHASE=
+PUBLICATION_LOG_DESTINATION=
+PUBLICATION_OPINION_DESTINATION=
 
 CCCC_CONSULT_CODEX_FEATURES='hooks
 plugins
@@ -192,7 +196,8 @@ cccc_consult_manifest_binding() {
 }
 
 cccc_consult_publish_manifest_source() {
-  local source=$1 destination=$2 parent_identity=$3 digest
+  local source=$1 destination=$2 parent_identity=$3 digest helper_rc=0
+  local publish_argv=()
   cccc_consult_manifest_binding "$source" || {
     cccc_die 'publication source is not registered in the owned manifest'
     return 5
@@ -251,8 +256,31 @@ print(hasher.hexdigest())
     *[!0-9a-f]*|'') return 5 ;;
   esac
   [ "${#digest}" -eq 64 ] || return 5
-  cccc_atomic_publish "$source" "$destination" "$parent_identity" \
-    "$CCCC_CONSULT_MANIFEST_ID" "$digest"
+  publish_argv=("$CCCC_PYTHON" -I "$SCRIPT_DIR/run-with-timeout.py" 0 --
+    "$CCCC_PYTHON" -I "$CCCC_COMMON_DIR/publish-no-clobber.py"
+    --parent-identity "$parent_identity"
+    --source-identity "$CCCC_CONSULT_MANIFEST_ID"
+    --source-sha256 "$digest" "$source" "$destination")
+  PENDING_SIGNAL_NUMBER=
+  PENDING_SIGNAL_NAME=
+  trap 'cccc_consult_defer_signal 1 HUP' HUP
+  trap 'cccc_consult_defer_signal 2 INT' INT
+  trap 'cccc_consult_defer_signal 15 TERM' TERM
+  (
+    trap - HUP INT TERM
+    unset BASH_ENV ENV
+    exec "${publish_argv[@]}"
+  ) &
+  ACTIVE_HELPER_PID=$!
+  trap 'cccc_consult_on_signal 1 HUP' HUP
+  trap 'cccc_consult_on_signal 2 INT' INT
+  trap 'cccc_consult_on_signal 15 TERM' TERM
+  if [ -n "$PENDING_SIGNAL_NAME" ]; then
+    cccc_consult_on_signal "$PENDING_SIGNAL_NUMBER" "$PENDING_SIGNAL_NAME"
+  fi
+  wait "$ACTIVE_HELPER_PID" || helper_rc=$?
+  ACTIVE_HELPER_PID=
+  return "$helper_rc"
 }
 
 cccc_consult_manifest_remove() {
@@ -589,9 +617,39 @@ cccc_consult_cleanup() {
   exit "$original_status"
 }
 
+cccc_consult_publication_interrupt_diagnostic() {
+  local log_exists=0 opinion_exists=0
+  if [ -n "$PUBLICATION_LOG_DESTINATION" ] &&
+    { [ -e "$PUBLICATION_LOG_DESTINATION" ] || [ -L "$PUBLICATION_LOG_DESTINATION" ]; }; then
+    log_exists=1
+  fi
+  if [ -n "$PUBLICATION_OPINION_DESTINATION" ] &&
+    { [ -e "$PUBLICATION_OPINION_DESTINATION" ] || [ -L "$PUBLICATION_OPINION_DESTINATION" ]; }; then
+    opinion_exists=1
+  fi
+  if [ "$log_exists" -eq 1 ] && [ "$opinion_exists" -eq 0 ]; then
+    cccc_die "publication interrupted after log commit; orphan log requires manual cleanup: remove $PUBLICATION_LOG_DESTINATION before retry"
+  elif [ "$opinion_exists" -eq 1 ]; then
+    cccc_die "publication interrupted after output commit; no success was recorded; manual cleanup or verification is required for $PUBLICATION_LOG_DESTINATION and $PUBLICATION_OPINION_DESTINATION"
+  fi
+}
+
 cccc_consult_on_signal() {
   local number=$1 name=$2 runner_rc=0 status_rc=125 had_runner=0 namespace_ok=1
+  local helper_rc=0
   trap '' HUP INT TERM
+  if [ -n "$ACTIVE_HELPER_PID" ]; then
+    if kill -0 "$ACTIVE_HELPER_PID" 2>/dev/null; then
+      kill -s "$name" "$ACTIVE_HELPER_PID" 2>/dev/null || true
+    fi
+    wait "$ACTIVE_HELPER_PID" 2>/dev/null || helper_rc=$?
+    ACTIVE_HELPER_PID=
+    cccc_consult_publication_interrupt_diagnostic
+    if [ "$helper_rc" -eq 125 ]; then
+      exit 125
+    fi
+    exit $((128 + number))
+  fi
   if [ -n "$RUNNER_PID" ]; then
     had_runner=1
     if kill -0 "$RUNNER_PID" 2>/dev/null; then
@@ -623,6 +681,7 @@ cccc_consult_on_signal() {
       cleanup-failure|runner-internal) exit 125 ;;
     esac
   fi
+  cccc_consult_publication_interrupt_diagnostic
   exit $((128 + number))
 }
 
@@ -1871,8 +1930,12 @@ EOF
   fi
   cccc_refuse_output_target "$opinion_destination" || return 5
   cccc_refuse_output_target "$log_destination" || return 5
+  PUBLICATION_LOG_DESTINATION=$log_destination
+  PUBLICATION_OPINION_DESTINATION=$opinion_destination
+  PUBLICATION_PHASE=log
   cccc_consult_publish_manifest_source \
     "$log_source" "$log_destination" "$log_parent_identity" || return 5
+  PUBLICATION_PHASE=opinion
   cccc_consult_publish_manifest_source \
     "$opinion_source" "$opinion_destination" "$opinion_parent_identity"
   publication_rc=$?
@@ -1890,8 +1953,12 @@ EOF
     return 125
   }
 
-  printf 'cccc: consult opinion: %s\n' "$opinion_destination"
-  printf 'cccc: consult log: %s\n' "$log_destination"
+  trap '' HUP INT TERM
+  printf 'cccc: consult opinion: %s\ncccc: consult log: %s\n' \
+    "$opinion_destination" "$log_destination"
+  PUBLICATION_PHASE=
+  PUBLICATION_LOG_DESTINATION=
+  PUBLICATION_OPINION_DESTINATION=
   return 0
 }
 
