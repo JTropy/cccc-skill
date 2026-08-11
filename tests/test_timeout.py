@@ -216,6 +216,125 @@ class TimeoutRunnerTests(unittest.TestCase):
 
 
 class TimeoutRunnerUnitTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal masks")
+    def test_interrupt_handlers_save_unblock_and_restore_signal_mask(self):
+        managed = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+        managed_set = set(managed)
+        original_mask = {signal.SIGTERM, signal.SIGUSR1}
+        original_handlers = {signum: object() for signum in managed}
+        events = []
+
+        def get_handler(signum):
+            events.append(("get-handler", signum))
+            return original_handlers[signum]
+
+        def set_handler(signum, handler):
+            events.append(("set-handler", signum, handler))
+
+        mask_calls = 0
+
+        def change_mask(operation, signals):
+            nonlocal mask_calls
+            mask_calls += 1
+            events.append(("mask", operation, set(signals)))
+            return original_mask if mask_calls == 1 else set()
+
+        with mock.patch.object(
+            RUNNER_MODULE.signal, "getsignal", side_effect=get_handler
+        ), mock.patch.object(
+            RUNNER_MODULE.signal, "signal", side_effect=set_handler
+        ), mock.patch.object(
+            RUNNER_MODULE.signal, "pthread_sigmask", side_effect=change_mask
+        ):
+            installed = RUNNER_MODULE.install_interrupt_handlers()
+            self.assertEqual(len(installed), 3)
+            _state, previous_handlers, previous_mask = installed
+            RUNNER_MODULE.restore_interrupt_handlers(previous_handlers, previous_mask)
+
+        self.assertEqual(previous_mask, original_mask)
+        first_set_handler = next(
+            index for index, event in enumerate(events) if event[0] == "set-handler"
+        )
+        unblock = events.index(("mask", signal.SIG_UNBLOCK, managed_set))
+        restore_block = events.index(("mask", signal.SIG_BLOCK, managed_set), unblock + 1)
+        restore_mask = events.index(("mask", signal.SIG_SETMASK, original_mask))
+        self.assertEqual(events[0], ("mask", signal.SIG_BLOCK, managed_set))
+        self.assertLess(first_set_handler, unblock)
+        self.assertLess(unblock, restore_block)
+        self.assertLess(restore_block, restore_mask)
+        for signum in managed:
+            self.assertIn(
+                ("set-handler", signum, original_handlers[signum]), events[restore_block:]
+            )
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal masks")
+    def test_interrupt_handler_unblock_failure_restores_handlers_and_mask(self):
+        managed = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+        original_mask = {signal.SIGTERM}
+        original_handlers = {signum: object() for signum in managed}
+        mask = mock.Mock(
+            side_effect=[original_mask, OSError("unblock failed"), set(), set()]
+        )
+
+        with mock.patch.object(
+            RUNNER_MODULE.signal,
+            "getsignal",
+            side_effect=lambda signum: original_handlers[signum],
+        ), mock.patch.object(RUNNER_MODULE.signal, "signal") as set_handler, \
+             mock.patch.object(RUNNER_MODULE.signal, "pthread_sigmask", mask):
+            with self.assertRaisesRegex(OSError, "unblock failed"):
+                RUNNER_MODULE.install_interrupt_handlers()
+
+        self.assertEqual(
+            set_handler.call_args_list[-len(managed):],
+            [mock.call(signum, original_handlers[signum]) for signum in managed],
+        )
+        self.assertEqual(mask.call_args_list[-1], mock.call(signal.SIG_SETMASK, original_mask))
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal masks")
+    def test_pending_signal_unblocked_before_popen_does_not_launch_child(self):
+        state = RUNNER_MODULE.InterruptState()
+        state.signum = signal.SIGTERM
+        previous_handlers = {signal.SIGTERM: signal.SIG_DFL}
+        previous_mask = {signal.SIGTERM}
+        with mock.patch.object(
+            RUNNER_MODULE,
+            "install_interrupt_handlers",
+            return_value=(state, previous_handlers, previous_mask),
+        ), mock.patch.object(
+            RUNNER_MODULE, "restore_interrupt_handlers", return_value=None
+        ) as restore, mock.patch.object(RUNNER_MODULE.subprocess, "Popen") as launch:
+            status = RUNNER_MODULE.run(["0", "--", "child"])
+
+        self.assertEqual(status, -signal.SIGTERM)
+        launch.assert_not_called()
+        restore.assert_called_once_with(previous_handlers, previous_mask)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal masks")
+    def test_signal_mask_restore_failure_returns_cleanup_status(self):
+        state = RUNNER_MODULE.InterruptState()
+        previous_handlers = {signal.SIGTERM: signal.SIG_DFL}
+        previous_mask = {signal.SIGTERM}
+        process = mock.Mock()
+        process.wait.return_value = 0
+        stderr = io.StringIO()
+        with mock.patch.object(
+            RUNNER_MODULE,
+            "install_interrupt_handlers",
+            return_value=(state, previous_handlers, previous_mask),
+        ), mock.patch.object(
+            RUNNER_MODULE,
+            "restore_interrupt_handlers",
+            return_value="could not restore signal mask",
+        ), mock.patch.object(
+            RUNNER_MODULE.subprocess, "Popen", return_value=process
+        ), mock.patch.object(RUNNER_MODULE.sys, "stderr", stderr):
+            status = RUNNER_MODULE.run(["0", "--", "child"])
+
+        self.assertEqual(status, 125)
+        self.assertIn("cleanup failed", stderr.getvalue())
+        self.assertIn("signal mask", stderr.getvalue())
+
     @unittest.skipUnless(os.name == "posix", "requires POSIX signal semantics")
     def test_signal_at_popen_boundary_is_cleaned_after_child_is_owned(self):
         process = mock.Mock()
@@ -246,11 +365,15 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "requires POSIX signal semantics")
     def test_popen_failure_restores_previous_signal_handler(self):
         previous = signal.getsignal(signal.SIGTERM)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
         with mock.patch.object(
             RUNNER_MODULE.subprocess, "Popen", side_effect=OSError("launch failed")
         ):
             RUNNER_MODULE.run(["1", "--", "child"])
         self.assertIs(signal.getsignal(signal.SIGTERM), previous)
+        self.assertEqual(
+            signal.pthread_sigmask(signal.SIG_BLOCK, set()), previous_mask
+        )
 
     def test_windows_bootstrap_assigns_job_before_releasing_gate(self):
         process = mock.Mock()
@@ -785,6 +908,49 @@ class PosixProcessGroupTests(unittest.TestCase):
         parent_pid, grandchild_pid = map(int, runner.stdout.readline().split())
         os.kill(runner.pid, signal.SIGTERM)
         _, stderr = runner.communicate(timeout=8)
+
+        self.assertEqual(
+            runner.returncode, -signal.SIGTERM, stderr.decode(errors="replace")
+        )
+        self.assert_pids_gone(parent_pid, grandchild_pid)
+
+    def test_runner_unblocks_inherited_sigterm_and_cleans_descendants(self):
+        child_code = (
+            "import os, subprocess, sys, time;"
+            "grandchild = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']);"
+            "print(f'{os.getpid()} {grandchild.pid}', flush=True);"
+            "time.sleep(30)"
+        )
+        launcher = (
+            "import os, signal, sys;"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM});"
+            "os.execv(sys.executable, [sys.executable, *sys.argv[1:]])"
+        )
+        runner = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                launcher,
+                str(RUNNER),
+                "0",
+                "--",
+                *child(child_code),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        parent_pid, grandchild_pid = map(int, runner.stdout.readline().split())
+        os.kill(runner.pid, signal.SIGTERM)
+        try:
+            _, stderr = runner.communicate(timeout=4)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(parent_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            runner.kill()
+            runner.communicate(timeout=2)
+            self.fail("runner did not handle inherited blocked SIGTERM")
 
         self.assertEqual(
             runner.returncode, -signal.SIGTERM, stderr.decode(errors="replace")

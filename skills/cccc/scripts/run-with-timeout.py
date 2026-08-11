@@ -294,21 +294,44 @@ def stop_windows(process, job=None):
 def install_interrupt_handlers():
     state = InterruptState()
     previous = {}
+    managed_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
     def interrupted(signum, _frame):
         state.signum = signum
         if state.process is not None:
             raise RunnerInterrupted(signum)
 
-    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        previous[signum] = signal.getsignal(signum)
-        signal.signal(signum, interrupted)
-    return state, previous
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, managed_signals)
+    try:
+        for signum in managed_signals:
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, interrupted)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, managed_signals)
+    except (OSError, RuntimeError, ValueError) as exc:
+        restore_error = restore_interrupt_handlers(previous, previous_mask)
+        if restore_error:
+            raise OSError(join_cleanup_errors(str(exc), restore_error)) from exc
+        raise
+    return state, previous, previous_mask
 
 
-def restore_interrupt_handlers(previous):
+def restore_interrupt_handlers(previous, previous_mask):
+    managed_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    errors = []
+    try:
+        signal.pthread_sigmask(signal.SIG_BLOCK, managed_signals)
+    except (OSError, RuntimeError, ValueError) as exc:
+        errors.append(f"could not block signals for restoration: {exc}")
     for signum, handler in previous.items():
-        signal.signal(signum, handler)
+        try:
+            signal.signal(signum, handler)
+        except (OSError, RuntimeError, ValueError) as exc:
+            errors.append(f"could not restore signal {signum} handler: {exc}")
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    except (OSError, RuntimeError, ValueError) as exc:
+        errors.append(f"could not restore signal mask: {exc}")
+    return join_cleanup_errors(*errors) or None
 
 
 def stop_process(process, job=None):
@@ -470,14 +493,22 @@ def run(argv):
 
     interrupt_state = None
     previous_handlers = None
+    previous_signal_mask = None
     job = None
     gate = None
     result = None
     process = None
     if os.name == "posix":
-        interrupt_state, previous_handlers = install_interrupt_handlers()
+        try:
+            interrupt_state, previous_handlers, previous_signal_mask = (
+                install_interrupt_handlers()
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            return cleanup_failed(f"could not install interrupt handlers: {exc}")
     try:
         try:
+            if interrupt_state is not None and interrupt_state.signum is not None:
+                raise RunnerInterrupted(interrupt_state.signum)
             if os.name == "nt":
                 process, gate, job, error, error_status = launch_windows_bootstrap(command)
                 if error:
@@ -512,7 +543,7 @@ def run(argv):
                 result = fail(f"seconds must be no greater than {MAX_TIMEOUT_SECONDS}")
         except RunnerInterrupted as interrupted:
             interrupt_state.process = None
-            error = stop_process(process, job)
+            error = stop_process(process, job) if process is not None else None
             result = cleanup_failed(error) if error else -interrupted.signum
         except OSError as exc:
             if process is None:
@@ -532,8 +563,12 @@ def run(argv):
         if interrupt_state is not None:
             interrupt_state.process = None
         if previous_handlers is not None:
-            restore_interrupt_handlers(previous_handlers)
-            if interrupt_state.signum is not None and result != 125:
+            restore_error = restore_interrupt_handlers(
+                previous_handlers, previous_signal_mask
+            )
+            if restore_error:
+                result = cleanup_failed(restore_error)
+            elif interrupt_state.signum is not None and result != 125:
                 result = -interrupt_state.signum
         if job is not None:
             close_error = job.close()
