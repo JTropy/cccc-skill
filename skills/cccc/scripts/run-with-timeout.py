@@ -567,6 +567,16 @@ def exit_with_signal_semantics(status):
     if status < 0 and os.name == "posix":
         signum = -status
         try:
+            signal.signal(signum, signal.SIG_DFL)
+        except (OSError, RuntimeError, ValueError):
+            # SIGKILL/SIGSTOP cannot have a disposition, but must still be resent.
+            pass
+        if hasattr(signal, "pthread_sigmask"):
+            try:
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, {signum})
+            except (OSError, RuntimeError, ValueError):
+                pass
+        try:
             os.kill(os.getpid(), signum)
         except OSError:
             return 128 + signum

@@ -183,6 +183,37 @@ class TimeoutRunnerTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, -signal.SIGKILL)
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal masks")
+    def test_natural_child_signal_unblocks_inherited_runner_mask(self):
+        launcher = (
+            "import os, signal, sys;"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM});"
+            "os.execv(sys.executable, [sys.executable, *sys.argv[1:]])"
+        )
+        child_code = (
+            "import os, signal;"
+            "signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM});"
+            "os.kill(os.getpid(), signal.SIGTERM)"
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                launcher,
+                str(RUNNER),
+                "2",
+                "--",
+                *child(child_code),
+            ],
+            capture_output=True,
+            timeout=8,
+        )
+
+        self.assertEqual(
+            result.returncode, -signal.SIGTERM, result.stderr.decode(errors="replace")
+        )
+
 
 class TimeoutRunnerUnitTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "requires POSIX signal semantics")
@@ -277,6 +308,77 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         self.assertIn("explicit interpreter", error)
         create_gate.assert_not_called()
         launch.assert_not_called()
+
+    def test_windows_bat_resolution_fails_without_starting_bootstrap(self):
+        with mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
+             mock.patch.object(shutil, "which", return_value=r"C:\\Tools\\agent.bat"), \
+             mock.patch.object(RUNNER_MODULE, "WindowsGate") as create_gate, \
+             mock.patch.object(RUNNER_MODULE.subprocess, "Popen") as launch:
+            _bootstrap, _gate, _job, error, status = RUNNER_MODULE.launch_windows_bootstrap(
+                ["agent", "prompt"]
+            )
+
+        self.assertEqual(status, 127)
+        self.assertIn("explicit interpreter", error)
+        create_gate.assert_not_called()
+        launch.assert_not_called()
+
+    def test_windows_missing_command_fails_without_starting_bootstrap(self):
+        with mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
+             mock.patch.object(shutil, "which", return_value=None), \
+             mock.patch.object(RUNNER_MODULE, "WindowsGate") as create_gate, \
+             mock.patch.object(RUNNER_MODULE.subprocess, "Popen") as launch:
+            _bootstrap, _gate, _job, error, status = RUNNER_MODULE.launch_windows_bootstrap(
+                ["missing-command", "prompt"]
+            )
+
+        self.assertEqual(status, 127)
+        self.assertIn("not found", error)
+        create_gate.assert_not_called()
+        launch.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal semantics")
+    def test_exit_signal_resets_unblocks_and_resignals(self):
+        events = []
+
+        def reset(signum, disposition):
+            events.append(("reset", signum, disposition))
+
+        def unblock(operation, signals):
+            events.append(("unblock", operation, signals))
+
+        def resend(pid, signum):
+            events.append(("resend", pid, signum))
+
+        with mock.patch.object(RUNNER_MODULE.signal, "signal", side_effect=reset), \
+             mock.patch.object(
+                 RUNNER_MODULE.signal, "pthread_sigmask", side_effect=unblock
+             ), \
+             mock.patch.object(RUNNER_MODULE.os, "getpid", return_value=4321), \
+             mock.patch.object(RUNNER_MODULE.os, "kill", side_effect=resend):
+            status = RUNNER_MODULE.exit_with_signal_semantics(-signal.SIGTERM)
+
+        self.assertEqual(status, -signal.SIGTERM)
+        self.assertEqual(
+            events,
+            [
+                ("reset", signal.SIGTERM, signal.SIG_DFL),
+                ("unblock", signal.SIG_UNBLOCK, {signal.SIGTERM}),
+                ("resend", 4321, signal.SIGTERM),
+            ],
+        )
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal semantics")
+    def test_exit_signal_resends_uncatchable_signal_when_reset_fails(self):
+        with mock.patch.object(
+            RUNNER_MODULE.signal, "signal", side_effect=OSError("uncatchable")
+        ), mock.patch.object(RUNNER_MODULE.signal, "pthread_sigmask"), \
+             mock.patch.object(RUNNER_MODULE.os, "getpid", return_value=4321), \
+             mock.patch.object(RUNNER_MODULE.os, "kill") as resend:
+            status = RUNNER_MODULE.exit_with_signal_semantics(-signal.SIGKILL)
+
+        self.assertEqual(status, -signal.SIGKILL)
+        resend.assert_called_once_with(4321, signal.SIGKILL)
 
     def test_windows_native_resolution_preserves_argument_boundaries(self):
         process = mock.Mock()
@@ -641,7 +743,7 @@ class PosixProcessGroupTests(unittest.TestCase):
             "print(f'{os.getpid()} {grandchild.pid}', flush=True);"
             "time.sleep(30)"
         )
-        for interrupted_by in (signal.SIGTERM, signal.SIGINT):
+        for interrupted_by in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             with self.subTest(interrupted_by=interrupted_by):
                 runner = subprocess.Popen(
                     command("0", "--", *child(child_code)),
@@ -654,6 +756,40 @@ class PosixProcessGroupTests(unittest.TestCase):
 
                 self.assertEqual(runner.returncode, -interrupted_by, stderr.decode(errors="replace"))
                 self.assert_pids_gone(parent_pid, grandchild_pid)
+
+    def test_runner_interrupt_with_inherited_ignored_sigterm_preserves_signal(self):
+        child_code = (
+            "import os, subprocess, sys, time;"
+            "grandchild = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']);"
+            "print(f'{os.getpid()} {grandchild.pid}', flush=True);"
+            "time.sleep(30)"
+        )
+        launcher = (
+            "import os, signal, sys;"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+            "os.execv(sys.executable, [sys.executable, *sys.argv[1:]])"
+        )
+        runner = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                launcher,
+                str(RUNNER),
+                "0",
+                "--",
+                *child(child_code),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        parent_pid, grandchild_pid = map(int, runner.stdout.readline().split())
+        os.kill(runner.pid, signal.SIGTERM)
+        _, stderr = runner.communicate(timeout=8)
+
+        self.assertEqual(
+            runner.returncode, -signal.SIGTERM, stderr.decode(errors="replace")
+        )
+        self.assert_pids_gone(parent_pid, grandchild_pid)
 
 
 @unittest.skipUnless(os.name == "nt", "requires Windows process handling")
