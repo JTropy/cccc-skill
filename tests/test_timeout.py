@@ -1151,6 +1151,7 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(shutil.which("bash"), "requires Bash")
+    @unittest.skipIf(os.name == "nt", "covered by the native MSYS runner integration")
     def test_windows_shell_argv_helper_round_trips_hostile_arguments(self):
         helper = (
             ROOT
