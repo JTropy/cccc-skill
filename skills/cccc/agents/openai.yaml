@@ -1,0 +1,4 @@
+interface:
+  display_name: "cccc Peer Collaboration"
+  short_description: "Delegate work or request a read-only peer review"
+  default_prompt: "Use $cccc to route this task to the appropriate local peer agent."
