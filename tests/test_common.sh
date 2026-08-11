@@ -51,18 +51,20 @@ test_common_library_exists() {
 }
 
 test_target_is_exact() {
-  local tmp old_path
+  local tmp old_path discovered_claude discovered_codex
   tmp=$(new_test_dir) || return 1
   cp "$TEST_DIR/fixtures/fake-agent.sh" "$tmp/claude"
   cp "$TEST_DIR/fixtures/fake-agent.sh" "$tmp/codex"
   chmod +x "$tmp/claude" "$tmp/codex"
   old_path=$PATH
   PATH="$tmp:$PATH"
+  discovered_claude=$(command -v claude) || return 1
+  discovered_codex=$(command -v codex) || return 1
   cccc_resolve_target_argv claude || return 1
   if [ "$COMMON_TEST_WINDOWS" -eq 1 ]; then
     assert_eq 2 "${#CCCC_TARGET_ARGV[@]}" "claude argv length" || return 1
     assert_eq bash "${CCCC_TARGET_ARGV[0]}" "resolved Claude interpreter" || return 1
-    assert_eq "$tmp/claude" "${CCCC_TARGET_ARGV[1]}" "resolved claude" || return 1
+    assert_eq "$discovered_claude" "${CCCC_TARGET_ARGV[1]}" "resolved claude" || return 1
   else
     assert_eq 1 "${#CCCC_TARGET_ARGV[@]}" "claude argv length" || return 1
     assert_eq "$tmp/claude" "${CCCC_TARGET_ARGV[0]}" "resolved claude" || return 1
@@ -71,7 +73,7 @@ test_target_is_exact() {
   if [ "$COMMON_TEST_WINDOWS" -eq 1 ]; then
     assert_eq 2 "${#CCCC_TARGET_ARGV[@]}" "codex argv length" || return 1
     assert_eq bash "${CCCC_TARGET_ARGV[0]}" "resolved Codex interpreter" || return 1
-    assert_eq "$tmp/codex" "${CCCC_TARGET_ARGV[1]}" "resolved codex" || return 1
+    assert_eq "$discovered_codex" "${CCCC_TARGET_ARGV[1]}" "resolved codex" || return 1
   else
     assert_eq "$tmp/codex" "${CCCC_TARGET_ARGV[0]}" "resolved codex" || return 1
   fi
