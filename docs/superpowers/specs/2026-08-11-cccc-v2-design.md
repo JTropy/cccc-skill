@@ -80,7 +80,7 @@ package.json
 -->
 ```
 
-每行表示一个仓库相对文件或目录前缀，不接受 glob、绝对路径与 `..`。任一层级的 `.git` 路径组件（大小写不敏感）及其后代永不允许，因为普通仓库的 Git metadata 目录、嵌套仓库 metadata 和 linked worktree 的 `.git` 指针都不在工作树内容快照内。解析策略时拒绝任何已存在的 symlink 路径组件，并验证最深的已存在父目录仍位于物理仓库根内；尚不存在的新路径仍只能得到事后审计，不能形成操作系统级写入隔离。wrapper 用 Git 前后快照验证本轮 tracked 与非 ignored untracked 变化全部落在允许范围内；Git metadata 与 Git-ignored 路径始终不在该审计边界，wrapper 每次运行都明确警告。
+每行表示一个仓库相对文件或目录前缀，不接受 glob、绝对路径与 `..`。任一层级的 `.git` 路径组件（大小写不敏感）及其后代永不允许，因为普通仓库的 Git metadata 目录、嵌套仓库 metadata 和 linked worktree 的 `.git` 指针都不在工作树内容快照内。为与 Git 的 NTFS 防护语义一致，尾随 ASCII 点/空格的 `.git`、`git~1` 短名及其变体同样拒绝；策略路径中的 `:` 一律拒绝，以封闭 alternate data stream 与不可移植路径别名。解析策略时拒绝任何已存在的 symlink 路径组件，并验证最深的已存在父目录仍位于物理仓库根内；尚不存在的新路径仍只能得到事后审计，不能形成操作系统级写入隔离。wrapper 用 Git 前后快照验证本轮 tracked 与非 ignored untracked 变化全部落在允许范围内；Git metadata 与 Git-ignored 路径始终不在该审计边界，wrapper 每次运行都明确警告。
 
 为避免 dirty baseline 下出现不可见的二次变化，v2 遇到 submodule/gitlink 或 Git 视为单个目录项的嵌套仓库时 fail closed；在实现递归指纹前，不把这类目录描述为已审计。人类可读的“边界”章节仍保留，用来解释理由和禁止项。
 
