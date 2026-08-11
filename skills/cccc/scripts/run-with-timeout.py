@@ -351,6 +351,7 @@ def wait_for_windows_bootstrap_gate(event_name, parent_pid):
     from ctypes import wintypes
 
     synchronize = 0x00100000
+    error_invalid_parameter = 87
     wait_object_0 = 0
     wait_timeout = 0x00000102
     wait_failed = 0xFFFFFFFF
@@ -371,8 +372,11 @@ def wait_for_windows_bootstrap_gate(event_name, parent_pid):
         return f"could not open Windows bootstrap gate: {ctypes.WinError(ctypes.get_last_error())}"
     parent = kernel32.OpenProcess(synchronize, False, parent_pid)
     if not parent:
+        error = ctypes.get_last_error()
         kernel32.CloseHandle(event)
-        return "parent"
+        if error == error_invalid_parameter:
+            return "parent"
+        return f"could not open parent process (Win32 error {error})"
     try:
         handles = (wintypes.HANDLE * 2)(event, parent)
         result = kernel32.WaitForMultipleObjects(

@@ -291,6 +291,23 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         self.assertEqual(result, "parent")
         self.assertEqual(kernel32.CloseHandle.call_args_list, [mock.call(20), mock.call(10)])
 
+    def test_windows_bootstrap_access_denied_never_starts_target(self):
+        kernel32 = mock.Mock()
+        kernel32.OpenEventW.return_value = 10
+        kernel32.OpenProcess.return_value = 0
+        kernel32.CloseHandle.return_value = True
+        stderr = io.StringIO()
+        with mock.patch.object(ctypes, "WinDLL", return_value=kernel32, create=True), \
+             mock.patch.object(ctypes, "get_last_error", return_value=5, create=True), \
+             mock.patch.object(RUNNER_MODULE.sys, "stderr", stderr), \
+             mock.patch.object(RUNNER_MODULE.subprocess, "Popen") as launch:
+            status = RUNNER_MODULE.run_windows_bootstrap("gate", 123, ["target"])
+
+        self.assertEqual(status, 127)
+        self.assertIn("could not open parent process", stderr.getvalue())
+        launch.assert_not_called()
+        kernel32.CloseHandle.assert_called_once_with(10)
+
     def test_windows_bootstrap_passes_original_command_without_stdio_overrides(self):
         process = mock.Mock()
         process.wait.return_value = 37
