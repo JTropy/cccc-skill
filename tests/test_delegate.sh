@@ -245,8 +245,11 @@ case ${CCCC_FAKE_SCENARIO:-success} in
   replace-run-dir)
     run_dir=$(find_run_dir) || exit 97
     printf '%s\n' "$run_dir" >"$CCCC_FAKE_ATTACK_PATH_FILE"
-    mv "$run_dir" "$run_dir.original"
-    mv "$CCCC_FAKE_VICTIM_DIR" "$run_dir"
+    if ! mv "$run_dir" "$run_dir.original" ||
+       ! mv "$CCCC_FAKE_VICTIM_DIR" "$run_dir"; then
+      : >"$CCCC_FAKE_ATTACK_UNSUPPORTED_FILE"
+      exit 88
+    fi
     ;;
   poison-run-artifact)
     run_dir=$(find_run_dir) || exit 97
@@ -258,10 +261,14 @@ case ${CCCC_FAKE_SCENARIO:-success} in
     ;;
   forge-runner-timeout)
     run_dir=$(find_run_dir) || exit 97
-    unlink "$run_dir/runner.status"
+    if ! unlink "$run_dir/runner.status" 2>/dev/null; then
+      : >"$CCCC_FAKE_ATTACK_UNSUPPORTED_FILE"
+      exit 124
+    fi
     umask 077
     printf '%s\n' 'cccc-timeout-result-v1 kind=wrapper-timeout value=none' >"$run_dir/runner.status"
     chmod 600 "$run_dir/runner.status"
+    : >"$CCCC_FAKE_ATTACK_APPLIED_FILE"
     ;;
   *)
     printf 'unknown fake scenario: %s\n' "$CCCC_FAKE_SCENARIO" >&2
@@ -443,7 +450,7 @@ for argument in arguments:
         text = "<RUN_REPORT>"
     elif text.startswith("You are the cccc delegated agent."):
         text = "<PROMPT>"
-    print(text)
+    sys.stdout.buffer.write(os.fsencode(text) + b"\n")
 PY
 }
 
@@ -495,8 +502,13 @@ require_windows_git_bash() {
 
 run_delegate_with_outer_timeout() {
   local target=${1:-codex} real_python outer_runner
+  local command_argv
   real_python=$(command -v python3) || return 1
   outer_runner="$ROOT_DIR/skills/cccc/scripts/run-with-timeout.py"
+  command_argv=("$DELEGATE" "$target" "$CASE_CARD" "$CASE_REPO")
+  if require_windows_git_bash; then
+    command_argv=(bash "$DELEGATE" "$target" "$CASE_CARD" "$CASE_REPO")
+  fi
   CASE_OUTPUT=$(env \
     PATH="$CASE_BIN:$ORIGINAL_PATH" TMPDIR="$CASE_TMP" \
     CCCC_FAKE_ARGV_FILE="$CASE_ARGV" CCCC_FAKE_ENV_FILE="$CASE_ENV" \
@@ -506,7 +518,7 @@ run_delegate_with_outer_timeout() {
     CCCC_FAKE_ARTIFACT_NAME="${CCCC_FAKE_ARTIFACT_NAME-}" \
     CCCC_FAKE_REFERENT="${CCCC_FAKE_REFERENT-}" \
     "$real_python" -I "$outer_runner" 4 -- \
-      "$DELEGATE" "$target" "$CASE_CARD" "$CASE_REPO" 2>&1)
+      "${command_argv[@]}" 2>&1)
   CASE_RC=$?
 }
 
@@ -1679,13 +1691,16 @@ test_codex_unsafe_report_sources_fail_boundedly() {
 }
 
 test_run_dir_replacement_never_deletes_replacement_victim() {
-  local victim attacked_path
+  local victim attacked_path unsupported
   prepare_case || return 1
   victim="$CASE_TMP/victim-directory"
+  unsupported="$CASE_DIR/run-dir-replacement-unsupported"
   mkdir "$victim" || return 1
   printf 'preexisting important data\n' >"$victim/preexisting-important.txt"
   CCCC_FAKE_SCENARIO=replace-run-dir CCCC_FAKE_VICTIM_DIR="$victim" \
+    CCCC_FAKE_ATTACK_UNSUPPORTED_FILE="$unsupported" \
     CCCC_FAKE_ATTACK_PATH_FILE="$CASE_DIR/attacked-run-path" run_delegate codex
+  [ ! -e "$unsupported" ] || return 77
   assert_eq 125 "$CASE_RC" 'run-dir identity-loss status' || return 1
   attacked_path=$(cat "$CASE_DIR/attacked-run-path") || return 1
   assert_eq 'preexisting important data' \
@@ -1813,9 +1828,19 @@ test_child_fifo_cannot_block_changed_paths() {
 }
 
 test_child_cannot_forge_authenticated_runner_outcome() {
+  local unsupported forged
   prepare_case || return 1
-  CCCC_FAKE_SCENARIO=forge-runner-timeout run_delegate codex
-  assert_eq 125 "$CASE_RC" 'forged runner outcome status' || return 1
+  unsupported="$CASE_DIR/status-forgery-unsupported"
+  forged="$CASE_DIR/status-forgery-applied"
+  CCCC_FAKE_SCENARIO=forge-runner-timeout \
+    CCCC_FAKE_ATTACK_UNSUPPORTED_FILE="$unsupported" \
+    CCCC_FAKE_ATTACK_APPLIED_FILE="$forged" run_delegate codex
+  if [ -e "$unsupported" ]; then
+    assert_eq 70 "$CASE_RC" 'OS-blocked forgery preserves natural child status' || return 1
+  else
+    [ -e "$forged" ] || { test_diag 'status forgery produced no capability marker'; return 1; }
+    assert_eq 125 "$CASE_RC" 'forged runner outcome status' || return 1
+  fi
   case "$CASE_OUTPUT" in
     *'runner outcome: kind=wrapper-timeout'*)
       test_diag 'child-forged status was trusted as a wrapper timeout'
@@ -2771,7 +2796,9 @@ test_run_dir_is_private_and_owned_cleanup_is_scoped() {
   prepare_case || return 1
   CCCC_FAKE_RUN_MODE_FILE="$CASE_DIR/mode" run_delegate codex
   assert_success_outputs || return 1
-  assert_eq 700 "$(cat "$CASE_DIR/mode")" 'run directory mode' || return 1
+  if ! require_windows_git_bash; then
+    assert_eq 700 "$(cat "$CASE_DIR/mode")" 'run directory mode' || return 1
+  fi
   if find "$CASE_TMP" -mindepth 1 -maxdepth 1 -type d -name 'cccc.*' -print -quit | grep -q .; then
     test_diag "owned run directory was not cleaned: $(find "$CASE_TMP" -mindepth 1 -maxdepth 1 -type d -name 'cccc.*' -print | tr '\n' ' ')"
     return 1

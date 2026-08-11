@@ -272,7 +272,7 @@ for argument in arguments:
         text = "<PRIVATE_CWD>"
     elif text.startswith("You are") or "expert consult" in text.lower() or "专家顾问" in text:
         text = "<PROMPT>"
-    print(text)
+    sys.stdout.buffer.write(os.fsencode(text) + b"\n")
 PY
 }
 
@@ -293,7 +293,7 @@ import sys
 arguments = open(sys.argv[1], "rb").read().split(b"\0")
 for raw in reversed(arguments):
     if raw:
-        print(os.fsdecode(raw))
+        sys.stdout.buffer.write(raw + b"\n")
         break
 PY
 }
