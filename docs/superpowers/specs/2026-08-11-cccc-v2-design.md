@@ -125,6 +125,8 @@ helper 在启动子进程前把 timeout 限制到所有支持平台都可安全�
 
 Python 3 因此成为 v2 的明确依赖；wrapper 在不同平台依次查找 `python3` 与 `python` 并验证主版本，不再在 macOS 缺少 `timeout` 时悄悄退化成无限运行。
 
+Windows 的 timeout helper 只执行已解析的 native executable，拒绝把 `.cmd`/`.bat` 交给隐式 shell。运行在 Git Bash 的 wrapper 负责把 `command -v` 找到的无扩展 POSIX shim 转成显式 `bash <shim> ...` argv；若只存在 batch shim 且无安全的 POSIX/native 入口则 fail closed，不拼接 `cmd.exe /c` 字符串。
+
 ## 安装与迁移
 
 新的安装目标是：
