@@ -6,6 +6,9 @@ import signal
 import shutil
 import io
 import ctypes
+import hashlib
+import hmac
+import json
 import subprocess
 import sys
 import tempfile
@@ -115,9 +118,139 @@ class TimeoutRunnerTests(unittest.TestCase):
             timeout=timeout,
         )
 
+    def run_runner_with_authenticated_status(
+        self, status_file, token_file, seconds, *program, timeout=10
+    ):
+        return subprocess.run(
+            command(
+                "--status-file",
+                str(status_file),
+                "--status-token-file",
+                str(token_file),
+                str(seconds),
+                "--",
+                *program,
+            ),
+            capture_output=True,
+            timeout=timeout,
+        )
+
     def assert_status(self, status_file, kind, value):
         expected = f"cccc-timeout-result-v1 kind={kind} value={value}\n"
         self.assertEqual(status_file.read_bytes(), expected.encode("ascii"))
+
+    def assert_authenticated_status(self, status_file, token, kind, value):
+        status_identity = status_file.stat()
+        canonical = (
+            f"cccc-timeout-result-v2 kind={kind} value={value} "
+            f"status_dev={status_identity.st_dev} "
+            f"status_ino={status_identity.st_ino}"
+        )
+        mac = hmac.new(
+            token, canonical.encode("ascii"), hashlib.sha256
+        ).hexdigest()
+        record = status_file.read_text(encoding="ascii")
+        self.assertEqual(record, f"{canonical} mac={mac}\n")
+        self.assertNotIn(token.hex(), record)
+
+    def test_authenticated_status_consumes_private_token_before_child_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            status_file = directory / "status"
+            token_file = directory / "token"
+            token = bytes(range(32))
+            token_file.write_bytes(token)
+            if os.name == "posix":
+                token_file.chmod(0o600)
+            child_state = directory / "child-state.json"
+            child_probe = (
+                "from pathlib import Path; import json, os, sys; "
+                "Path(sys.argv[1]).write_text(json.dumps({"
+                "'argv': sys.argv, 'env': dict(os.environ), "
+                "'token_exists': Path(sys.argv[2]).exists()}), encoding='utf-8')"
+            )
+
+            result = self.run_runner_with_authenticated_status(
+                status_file,
+                token_file,
+                2,
+                *child(child_probe),
+                str(child_state),
+                str(token_file),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            self.assertFalse(token_file.exists())
+            observed = child_state.read_bytes()
+            if token in observed or token.hex().encode("ascii") in observed:
+                self.fail("authenticated token was visible in child argv or environment")
+            self.assertFalse(
+                json.loads(observed.decode("utf-8"))["token_exists"]
+            )
+            self.assert_authenticated_status(status_file, token, "child-exit", 0)
+
+    def test_authenticated_status_rejects_unsafe_or_malformed_token_without_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            sentinel = directory / "started"
+            cases = []
+            missing = directory / "missing-token"
+            cases.append(("missing", missing))
+            short = directory / "short-token"
+            short.write_bytes(b"x" * 31)
+            cases.append(("short", short))
+            long = directory / "long-token"
+            long.write_bytes(b"x" * 33)
+            cases.append(("long", long))
+            if os.name == "posix":
+                unsafe_mode = directory / "unsafe-mode-token"
+                unsafe_mode.write_bytes(b"x" * 32)
+                unsafe_mode.chmod(0o644)
+                cases.append(("unsafe-mode", unsafe_mode))
+                token_target = directory / "token-target"
+                token_target.write_bytes(b"x" * 32)
+                token_target.chmod(0o600)
+                token_link = directory / "token-link"
+                token_link.symlink_to(token_target)
+                cases.append(("symlink", token_link))
+                token_fifo = directory / "token-fifo"
+                os.mkfifo(token_fifo)
+                cases.append(("fifo", token_fifo))
+
+            for name, token_file in cases:
+                with self.subTest(name=name):
+                    status_file = directory / f"status-{name}"
+                    result = self.run_runner_with_authenticated_status(
+                        status_file,
+                        token_file,
+                        2,
+                        *child(
+                            "from pathlib import Path; import sys; "
+                            "Path(sys.argv[1]).touch()"
+                        ),
+                        str(sentinel),
+                        timeout=4,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(sentinel.exists())
+                    self.assertIn(b"token", result.stderr.lower())
+
+    def test_token_option_requires_status_file_and_exact_pairing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+            token_file.write_bytes(b"x" * 32)
+            if os.name == "posix":
+                token_file.chmod(0o600)
+            invalid = [
+                ["--status-token-file", str(token_file), "1", "--", *child("pass")],
+                ["--status-file", str(Path(directory) / "status"), "--status-token-file"],
+            ]
+            for arguments in invalid:
+                with self.subTest(arguments=arguments):
+                    result = subprocess.run(command(*arguments), capture_output=True, timeout=4)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertTrue(result.stderr.strip())
+                    self.assertIn(b"status-token-file", result.stderr)
 
     def test_rejects_bad_invocation(self):
         invalid = [
@@ -669,6 +802,64 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
 
         self.assertEqual(status, -signal.SIGKILL)
         resend.assert_called_once_with(4321, signal.SIGKILL)
+
+    def test_windows_large_child_exit_uses_fixed_transport_status(self):
+        with mock.patch.object(RUNNER_MODULE.os, "name", "nt"):
+            self.assertEqual(
+                RUNNER_MODULE.exit_with_signal_semantics(4_294_967_295), 70
+            )
+            self.assertEqual(RUNNER_MODULE.exit_with_signal_semantics(255), 255)
+
+    def test_windows_bootstrap_main_preserves_target_dword_exit_status(self):
+        for target_status in (0x12345678, 0xFFFFFFFF):
+            with self.subTest(target_status=target_status), \
+                 mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
+                 mock.patch.object(
+                     RUNNER_MODULE.sys,
+                     "argv",
+                     [
+                         "run-with-timeout.py",
+                         "--windows-bootstrap",
+                         "gate",
+                         "123",
+                         "--",
+                         "target",
+                     ],
+                 ), \
+                 mock.patch.object(
+                     RUNNER_MODULE,
+                     "run_windows_bootstrap",
+                     return_value=target_status,
+                 ):
+                self.assertEqual(RUNNER_MODULE.main(), target_status)
+
+    def test_windows_child_exit_above_dword_is_runner_internal_failure(self):
+        process = mock.Mock()
+        process.wait.return_value = 0x1_0000_0000
+        gate = mock.Mock()
+        gate.close.return_value = None
+        job = mock.Mock()
+        job.close.return_value = None
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            status_file = Path(directory) / "status"
+            with mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
+                 mock.patch.object(
+                     RUNNER_MODULE,
+                     "launch_windows_bootstrap",
+                     return_value=(process, gate, job, None, None),
+                 ), \
+                 mock.patch.object(RUNNER_MODULE.sys, "stderr", stderr):
+                status = RUNNER_MODULE.run(
+                    ["--status-file", str(status_file), "1", "--", "target"]
+                )
+
+            self.assertEqual(status, 125)
+            self.assertEqual(
+                status_file.read_text(encoding="ascii"),
+                "cccc-timeout-result-v1 kind=runner-internal value=none\n",
+            )
+            self.assertIn("invalid Windows child exit status", stderr.getvalue())
 
     def test_windows_native_resolution_preserves_argument_boundaries(self):
         process = mock.Mock()

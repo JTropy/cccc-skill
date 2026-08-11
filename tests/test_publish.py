@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import importlib.util
 import os
 import signal
@@ -28,11 +29,20 @@ class PublishNoClobberTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def run_publish(
-        self, source: Path, destination: Path, parent_identity: str | None = None
+        self,
+        source: Path,
+        destination: Path,
+        parent_identity: str | None = None,
+        source_identity: str | None = None,
+        source_sha256: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         arguments = [sys.executable, "-I", str(PUBLISHER)]
         if parent_identity is not None:
             arguments.extend(["--parent-identity", parent_identity])
+        if source_identity is not None:
+            arguments.extend(["--source-identity", source_identity])
+        if source_sha256 is not None:
+            arguments.extend(["--source-sha256", source_sha256])
         arguments.extend([str(source), str(destination)])
         return subprocess.run(
             arguments,
@@ -103,6 +113,81 @@ class PublishNoClobberTests(unittest.TestCase):
 
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(b"payload", destination.read_bytes())
+
+    def test_expected_source_identity_and_digest_allow_normal_publication(self) -> None:
+        source = self.root / "source"
+        destination = self.root / "destination"
+        payload = b"bound payload"
+        source.write_bytes(payload)
+        value = os.stat(source, follow_symlinks=False)
+        identity = f"{value.st_dev}:{value.st_ino}"
+        digest = hashlib.sha256(payload).hexdigest()
+
+        result = self.run_publish(
+            source,
+            destination,
+            source_identity=identity,
+            source_sha256=digest,
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(payload, destination.read_bytes())
+
+    def test_expected_source_identity_rejects_preopen_replacement(self) -> None:
+        source = self.root / "source"
+        original = self.root / "original-source"
+        destination = self.root / "destination"
+        source.write_bytes(b"trusted")
+        value = os.stat(source, follow_symlinks=False)
+        identity = f"{value.st_dev}:{value.st_ino}"
+        source.rename(original)
+        source.write_bytes(b"forged")
+
+        result = self.run_publish(source, destination, source_identity=identity)
+
+        self.assertEqual(5, result.returncode, result.stderr)
+        self.assertFalse(destination.exists())
+        self.assertEqual(b"forged", source.read_bytes())
+        self.assertEqual(b"trusted", original.read_bytes())
+        self.assert_no_temps()
+
+    def test_expected_source_digest_rejects_same_inode_mutation(self) -> None:
+        source = self.root / "source"
+        destination = self.root / "destination"
+        source.write_bytes(b"trusted")
+        value = os.stat(source, follow_symlinks=False)
+        identity = f"{value.st_dev}:{value.st_ino}"
+        digest = hashlib.sha256(b"trusted").hexdigest()
+        source.write_bytes(b"forged")
+
+        result = self.run_publish(
+            source,
+            destination,
+            source_identity=identity,
+            source_sha256=digest,
+        )
+
+        self.assertEqual(5, result.returncode, result.stderr)
+        self.assertFalse(destination.exists())
+        self.assertEqual(b"forged", source.read_bytes())
+        self.assert_no_temps()
+
+    def test_source_reparse_metadata_is_rejected_before_open(self) -> None:
+        module = self.load_module()
+        source = self.root / "source"
+        source.write_bytes(b"payload")
+        actual = os.lstat(source)
+        reparse = mock.Mock(
+            st_mode=actual.st_mode,
+            st_dev=actual.st_dev,
+            st_ino=actual.st_ino,
+            st_file_attributes=0x400,
+            st_reparse_tag=0,
+        )
+
+        with mock.patch.object(module.os, "lstat", return_value=reparse):
+            with self.assertRaises(module.PublishError):
+                module._open_verified_source(source)
 
     def test_expected_parent_identity_rejects_symlink_replacement(self) -> None:
         parent = self.root / "output"

@@ -371,21 +371,49 @@ cccc_acquire_claim() {
 
 cccc_atomic_publish() {
   local source=${1-} destination=${2-} parent_identity=${3-}
-  if [ -z "$source" ] || [ -z "$destination" ] || [ "$#" -gt 3 ]; then
+  local source_identity=${4-} source_digest=${5-}
+  if [ -z "$source" ] || [ -z "$destination" ] || [ "$#" -lt 2 ] || [ "$#" -gt 5 ]; then
     cccc_die 'atomic publish requires source and destination'
     return 1
   fi
   cccc_find_python3 || return 1
-  if [ "$#" -eq 3 ]; then
+  if [ "$#" -ge 3 ]; then
     [ -n "$parent_identity" ] || {
       cccc_die 'destination parent identity must not be empty'
       return 1
     }
-    "$CCCC_PYTHON" -I "$CCCC_COMMON_DIR/publish-no-clobber.py" \
-      --parent-identity "$parent_identity" "$source" "$destination"
-    return $?
   fi
-  "$CCCC_PYTHON" -I "$CCCC_COMMON_DIR/publish-no-clobber.py" "$source" "$destination"
+  if [ "$#" -ge 4 ]; then
+    [ -n "$source_identity" ] || {
+      cccc_die 'source identity must not be empty'
+      return 1
+    }
+  fi
+  if [ "$#" -eq 5 ]; then
+    [ -n "$source_digest" ] || {
+      cccc_die 'source digest must not be empty'
+      return 1
+    }
+  fi
+  case "$#" in
+    2)
+      "$CCCC_PYTHON" -I "$CCCC_COMMON_DIR/publish-no-clobber.py" "$source" "$destination"
+      ;;
+    3)
+      "$CCCC_PYTHON" -I "$CCCC_COMMON_DIR/publish-no-clobber.py" \
+        --parent-identity "$parent_identity" "$source" "$destination"
+      ;;
+    4)
+      "$CCCC_PYTHON" -I "$CCCC_COMMON_DIR/publish-no-clobber.py" \
+        --parent-identity "$parent_identity" --source-identity "$source_identity" \
+        "$source" "$destination"
+      ;;
+    5)
+      "$CCCC_PYTHON" -I "$CCCC_COMMON_DIR/publish-no-clobber.py" \
+        --parent-identity "$parent_identity" --source-identity "$source_identity" \
+        --source-sha256 "$source_digest" "$source" "$destination"
+      ;;
+  esac
 }
 
 cccc_capture_destination_parent_identity() {

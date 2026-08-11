@@ -2,8 +2,11 @@
 """Run a command with a portable wall-clock timeout."""
 
 import os
+import hashlib
+import hmac
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -12,6 +15,7 @@ import uuid
 
 USAGE = (
     "usage: run-with-timeout.py [--status-file ABSENT_PRIVATE_PATH] "
+    "[--status-token-file EXISTING_PRIVATE_TOKEN] "
     "SECONDS -- COMMAND [ARG ...]"
 )
 CLEANUP_GRACE_SECONDS = 2
@@ -19,7 +23,10 @@ POLL_INTERVAL_SECONDS = 0.05
 # Keep the timeout safely representable as milliseconds on every supported platform.
 MAX_TIMEOUT_SECONDS = min(sys.maxsize // 1000, (2**31 - 1) // 1000)
 WINDOWS_BOOTSTRAP_WAIT_MS = 10_000
-STATUS_VERSION = "cccc-timeout-result-v1"
+STATUS_VERSION_V1 = "cccc-timeout-result-v1"
+STATUS_VERSION_V2 = "cccc-timeout-result-v2"
+STATUS_TOKEN_BYTES = 32
+WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 
 class RunnerInterrupted(Exception):
@@ -50,15 +57,29 @@ def cleanup_failed(message):
 class StatusFile:
     """A runner-owned, non-inherited file for one trusted outcome record."""
 
-    def __init__(self, fd):
+    def __init__(self, fd, identity):
         self.fd = fd
+        self.status_dev = identity.st_dev
+        self.status_ino = identity.st_ino
+        self.token = None
+
+    def authenticate(self, token):
+        self.token = token
 
     def write(self, kind, value=None):
         try:
             value_text = "none" if value is None else str(int(value))
-            record = (
-                f"{STATUS_VERSION} kind={kind} value={value_text}\n".encode("ascii")
-            )
+            if self.token is None:
+                record = (
+                    f"{STATUS_VERSION_V1} kind={kind} value={value_text}\n"
+                ).encode("ascii")
+            else:
+                canonical = (
+                    f"{STATUS_VERSION_V2} kind={kind} value={value_text} "
+                    f"status_dev={self.status_dev} status_ino={self.status_ino}"
+                ).encode("ascii")
+                mac = hmac.new(self.token, canonical, hashlib.sha256).hexdigest()
+                record = canonical + f" mac={mac}\n".encode("ascii")
             offset = 0
             while offset < len(record):
                 written = os.write(self.fd, record[offset:])
@@ -91,6 +112,14 @@ def create_status_file(path):
         os.set_inheritable(fd, False)
         if os.name == "posix":
             os.fchmod(fd, 0o600)
+        identity = os.fstat(fd)
+        if not stat.S_ISREG(identity.st_mode):
+            raise OSError("created status object is not a regular file")
+        if os.name == "nt" and (
+            getattr(identity, "st_file_attributes", 0)
+            & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            raise OSError("created status object is a reparse point")
     except (OSError, TypeError, ValueError) as exc:
         if "fd" in locals():
             try:
@@ -99,15 +128,120 @@ def create_status_file(path):
                 pass
         print(f"cccc-timeout: cannot create status file safely: {exc}", file=sys.stderr)
         return None
-    return StatusFile(fd)
+    return StatusFile(fd, identity)
 
 
-def parse_status_option(argv):
+def parse_status_options(argv):
     if not argv or argv[0] != "--status-file":
-        return None, argv, None
+        if argv and argv[0] == "--status-token-file":
+            return None, None, argv, fail(
+                "--status-token-file requires --status-file"
+            )
+        return None, None, argv, None
     if len(argv) < 2 or not argv[1]:
-        return None, argv, fail(USAGE)
-    return argv[1], argv[2:], None
+        return None, None, argv, fail(USAGE)
+    status_path = argv[1]
+    argv = argv[2:]
+    token_path = None
+    if argv and argv[0] == "--status-token-file":
+        if len(argv) < 2 or not argv[1]:
+            return None, None, argv, fail(
+                "--status-token-file requires an existing private token path"
+            )
+        token_path = argv[1]
+        argv = argv[2:]
+    return status_path, token_path, argv, None
+
+
+def is_reparse_point(info):
+    return bool(
+        getattr(info, "st_file_attributes", 0)
+        & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+def validate_token_identity(info):
+    if not stat.S_ISREG(info.st_mode):
+        return "status token is not a regular file"
+    if os.name == "nt" and is_reparse_point(info):
+        return "status token must not be a reparse point"
+    if os.name == "posix":
+        if info.st_uid != os.geteuid():
+            return "status token is not owned by the current user"
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            return "status token permissions are not private"
+        if info.st_nlink != 1:
+            return "status token must have exactly one link"
+    # Python's standard library exposes no portable Windows DACL inspection.
+    # On Windows we still enforce a regular, non-reparse object and identity.
+    return None
+
+
+def same_file_identity(left, right):
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def read_status_token(fd):
+    chunks = []
+    remaining = STATUS_TOKEN_BYTES + 1
+    while remaining:
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def consume_status_token(path):
+    """Read and remove one safe token without ever exposing it to a child."""
+    fd = None
+    identity = None
+    token = None
+    try:
+        path_identity = os.lstat(path)
+        validation_error = validate_token_identity(path_identity)
+        if validation_error:
+            return None, validation_error, 2
+
+        flags = os.O_RDONLY
+        for optional_flag in ("O_NOFOLLOW", "O_CLOEXEC", "O_NONBLOCK", "O_BINARY"):
+            flags |= getattr(os, optional_flag, 0)
+        fd = os.open(path, flags)
+        os.set_inheritable(fd, False)
+        identity = os.fstat(fd)
+        validation_error = validate_token_identity(identity)
+        if validation_error:
+            return None, validation_error, 2
+        if not same_file_identity(path_identity, identity):
+            return None, "status token identity changed while opening", 2
+        token = read_status_token(fd)
+    except (OSError, TypeError, ValueError) as exc:
+        return None, f"cannot read status token safely: {exc}", 2
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError as exc:
+                return None, f"could not close status token: {exc}", 125
+
+    try:
+        current_identity = os.lstat(path)
+        if not same_file_identity(identity, current_identity):
+            return None, "status token identity changed before removal", 125
+        os.unlink(path)
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            pass
+        else:
+            return None, "status token still exists after removal", 125
+    except OSError as exc:
+        return None, f"could not remove status token: {exc}", 125
+
+    if len(token) != STATUS_TOKEN_BYTES:
+        return None, f"status token must contain exactly {STATUS_TOKEN_BYTES} bytes", 2
+    return token, None, None
 
 
 def finish_with_status(status_file, result, kind, value=None):
@@ -567,12 +701,22 @@ def run_windows_bootstrap(event_name, parent_pid, command):
 
 
 def run(argv):
-    status_path, argv, option_error = parse_status_option(argv)
+    status_path, token_path, argv, option_error = parse_status_options(argv)
     if option_error is not None:
         return option_error
     status_file = create_status_file(status_path) if status_path is not None else None
     if status_path is not None and status_file is None:
         return 2
+    if token_path is not None:
+        token, token_error, token_error_status = consume_status_token(token_path)
+        if token_error is not None:
+            close_error = status_file.close()
+            if close_error:
+                return cleanup_failed(join_cleanup_errors(token_error, close_error))
+            if token_error_status == 125:
+                return cleanup_failed(token_error)
+            return fail(token_error)
+        status_file.authenticate(token)
 
     seconds, command, error = parse_arguments(argv)
     if error is not None:
@@ -635,8 +779,17 @@ def run(argv):
                         result_kind = "child-exit"
                         result_value = result
                 else:
-                    result_kind = "child-exit"
-                    result_value = result
+                    if not isinstance(result, int) or not 0 <= result <= 0xFFFFFFFF:
+                        print(
+                            "cccc-timeout: invalid Windows child exit status",
+                            file=sys.stderr,
+                        )
+                        result = 125
+                        result_kind = "runner-internal"
+                        result_value = None
+                    else:
+                        result_kind = "child-exit"
+                        result_value = result
             if interrupt_state is not None:
                 interrupt_state.process = None
         except subprocess.TimeoutExpired:
@@ -746,14 +899,18 @@ def main():
         except ValueError:
             print("cccc-timeout: invalid Windows bootstrap parent pid", file=sys.stderr)
             return 127
-        return exit_with_signal_semantics(
-            run_windows_bootstrap(sys.argv[2], parent_pid, sys.argv[5:])
-        )
+        # This process is the bootstrap child.  Its native exit status is the
+        # target's DWORD and must reach the outer runner without normalization.
+        return run_windows_bootstrap(sys.argv[2], parent_pid, sys.argv[5:])
     status = run(sys.argv[1:])
     return exit_with_signal_semantics(status)
 
 
 def exit_with_signal_semantics(status):
+    if os.name == "nt" and status > 255:
+        # Preserve the native DWORD in the authenticated status record while
+        # using one stable shell transport code for values shells cannot carry.
+        return 70
     if status < 0 and os.name == "posix":
         signum = -status
         try:

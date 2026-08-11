@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -31,14 +33,21 @@ def _format_identity(value) -> str:
     return f"{device}:{inode}"
 
 
-def _parse_identity(value: str) -> tuple[int, int]:
+def _parse_identity(value: str, subject: str = "destination parent") -> tuple[int, int]:
     fields = value.split(":")
     if (
         len(fields) != 2
         or any(not field.isascii() or not field.isdecimal() for field in fields)
+        or any(str(int(field)) != field for field in fields)
     ):
-        raise PublishError("destination parent identity must be DEV:INO decimal integers")
+        raise PublishError(f"{subject} identity must be DEV:INO decimal integers")
     return int(fields[0]), int(fields[1])
+
+
+def _parse_sha256(value: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise PublishError("source SHA-256 must be exactly 64 lowercase hexadecimal characters")
+    return value
 
 
 def _is_reparse_point(value) -> bool:
@@ -143,13 +152,17 @@ def capture_parent_identity(destination: Path) -> str:
         os.close(descriptor)
 
 
-def _open_verified_source(path: Path):
+def _open_verified_source(
+    path: Path,
+    expected_identity: tuple[int, int] | None = None,
+    expected_sha256: str | None = None,
+):
     try:
         before = os.lstat(path)
     except OSError as error:
         raise PublishError(f"cannot inspect source: {error}") from error
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-        raise PublishError("source must be a regular, non-symlink file")
+    if stat.S_ISLNK(before.st_mode) or _is_reparse_point(before) or not stat.S_ISREG(before.st_mode):
+        raise PublishError("source must be a regular, non-symlink, non-reparse file")
 
     flags = os.O_RDONLY
     flags |= getattr(os, "O_NONBLOCK", 0)
@@ -161,10 +174,33 @@ def _open_verified_source(path: Path):
 
     try:
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode):
+        if not stat.S_ISREG(opened.st_mode) or _is_reparse_point(opened):
             raise PublishError("source changed type while opening")
         if _identity(before) != _identity(opened):
             raise PublishError("source changed while opening")
+        if expected_identity is not None and _identity(opened) != expected_identity:
+            raise PublishError("source identity changed")
+        if expected_sha256 is not None:
+            hasher = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+            after_digest = os.fstat(descriptor)
+            if _is_reparse_point(after_digest) or _identity(after_digest) != _identity(opened):
+                raise PublishError("source changed while hashing")
+            before_metadata = (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+            after_metadata = (
+                after_digest.st_size,
+                after_digest.st_mtime_ns,
+                after_digest.st_ctime_ns,
+            )
+            if before_metadata != after_metadata:
+                raise PublishError("source changed while hashing")
+            if not secrets.compare_digest(hasher.hexdigest(), expected_sha256):
+                raise PublishError("source SHA-256 changed")
+            os.lseek(descriptor, 0, os.SEEK_SET)
     except BaseException:
         os.close(descriptor)
         raise
@@ -173,6 +209,8 @@ def _open_verified_source(path: Path):
 
 def _verify_source_after_copy(path: Path, descriptor: int, opened_stat) -> None:
     copied_stat = os.fstat(descriptor)
+    if _is_reparse_point(copied_stat):
+        raise PublishError("opened source became a reparse point")
     opened_metadata = (
         opened_stat.st_size,
         opened_stat.st_mtime_ns,
@@ -189,7 +227,11 @@ def _verify_source_after_copy(path: Path, descriptor: int, opened_stat) -> None:
         current_path_stat = os.lstat(path)
     except OSError as error:
         raise PublishError(f"source path changed while being copied: {error}") from error
-    if stat.S_ISLNK(current_path_stat.st_mode) or not stat.S_ISREG(current_path_stat.st_mode):
+    if (
+        stat.S_ISLNK(current_path_stat.st_mode)
+        or _is_reparse_point(current_path_stat)
+        or not stat.S_ISREG(current_path_stat.st_mode)
+    ):
         raise PublishError("source path changed type while being copied")
     if _identity(current_path_stat) != _identity(copied_stat):
         raise PublishError("source path changed identity while being copied")
@@ -267,10 +309,19 @@ def _report_cleanup_error(error: BaseException, committed: bool, failure_in_prog
 
 
 def _publish_with_dirfd(
-    source: Path, destination_name: str, parent_fd: int
+    source: Path,
+    destination_name: str,
+    parent_fd: int,
+    expected_source_identity: tuple[int, int] | None,
+    expected_source_sha256: str | None,
 ) -> None:
     _destination_absent_at(parent_fd, destination_name)
-    source_fd, source_opened_stat = _open_verified_source(source)
+    if expected_source_identity is None and expected_source_sha256 is None:
+        source_fd, source_opened_stat = _open_verified_source(source)
+    else:
+        source_fd, source_opened_stat = _open_verified_source(
+            source, expected_source_identity, expected_source_sha256
+        )
     temp_fd = None  # type: Optional[int]
     temp_name = None  # type: Optional[str]
     cleanup_error = None  # type: Optional[OSError]
@@ -329,7 +380,11 @@ def _unlink_verified_fallback_temp(
     try:
         _verify_parent_path(parent_path, parent_identity)
         current = os.lstat(temp_path)
-        if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or _is_reparse_point(current)
+            or not stat.S_ISREG(current.st_mode)
+        ):
             raise PublishError("owned temporary path changed type before cleanup")
         if _identity(current) != temp_identity:
             raise PublishError("owned temporary path changed identity before cleanup")
@@ -345,6 +400,8 @@ def _publish_without_dirfd(
     source: Path,
     destination: Path,
     parent_identity: tuple[int, int],
+    expected_source_identity: tuple[int, int] | None,
+    expected_source_sha256: str | None,
 ) -> None:
     _verify_parent_path(destination.parent, parent_identity)
     try:
@@ -356,7 +413,12 @@ def _publish_without_dirfd(
     else:
         raise PublishError("destination already exists")
 
-    source_fd, source_opened_stat = _open_verified_source(source)
+    if expected_source_identity is None and expected_source_sha256 is None:
+        source_fd, source_opened_stat = _open_verified_source(source)
+    else:
+        source_fd, source_opened_stat = _open_verified_source(
+            source, expected_source_identity, expected_source_sha256
+        )
     temp_fd = None  # type: Optional[int]
     temp_path = None  # type: Optional[Path]
     temp_identity = None  # type: Optional[tuple[int, int]]
@@ -412,7 +474,11 @@ def _publish_without_dirfd(
 
 
 def publish(
-    source: Path, destination: Path, expected_parent_identity: str | None = None
+    source: Path,
+    destination: Path,
+    expected_parent_identity: str | None = None,
+    expected_source_identity: str | None = None,
+    expected_source_sha256: str | None = None,
 ) -> None:
     """Copy source, fsync it, then hard-link it beneath a verified parent."""
     if not source.name or not destination.name:
@@ -422,13 +488,35 @@ def publish(
         if expected_parent_identity is not None
         else None
     )
+    source_identity = (
+        _parse_identity(expected_source_identity, "source")
+        if expected_source_identity is not None
+        else None
+    )
+    source_sha256 = (
+        _parse_sha256(expected_source_sha256)
+        if expected_source_sha256 is not None
+        else None
+    )
     parent_fd, opened_parent = _open_verified_parent(destination.parent, expected)
     opened_identity = _identity(opened_parent)
     try:
         if _supports_pinned_dirfd():
-            _publish_with_dirfd(source, destination.name, parent_fd)
+            _publish_with_dirfd(
+                source,
+                destination.name,
+                parent_fd,
+                source_identity,
+                source_sha256,
+            )
         else:
-            _publish_without_dirfd(source, destination, opened_identity)
+            _publish_without_dirfd(
+                source,
+                destination,
+                opened_identity,
+                source_identity,
+                source_sha256,
+            )
     finally:
         os.close(parent_fd)
 
@@ -439,18 +527,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         if len(arguments) == 2 and arguments[0] == "--print-parent-identity":
             print(capture_parent_identity(Path(arguments[1])))
             return 0
-        if len(arguments) == 4 and arguments[0] == "--parent-identity":
-            identity, source, destination = arguments[1:]
-            publish(Path(source), Path(destination), identity)
-            return 0
+        options: dict[str, str] = {}
+        while arguments and arguments[0].startswith("--"):
+            option = arguments[0]
+            if option not in {
+                "--parent-identity",
+                "--source-identity",
+                "--source-sha256",
+            }:
+                print(
+                    "usage: publish-no-clobber.py [--parent-identity DEV:INO] "
+                    "[--source-identity DEV:INO] [--source-sha256 HEX] "
+                    "SOURCE DESTINATION",
+                    file=sys.stderr,
+                )
+                return USAGE_ERROR
+            arguments.pop(0)
+            if option in options or not arguments:
+                raise PublishError(f"invalid or duplicate publisher option: {option}")
+            options[option] = arguments.pop(0)
         if len(arguments) != 2:
             print(
                 "usage: publish-no-clobber.py [--parent-identity DEV:INO] "
+                "[--source-identity DEV:INO] [--source-sha256 HEX] "
                 "SOURCE DESTINATION",
                 file=sys.stderr,
             )
             return USAGE_ERROR
-        publish(Path(arguments[0]), Path(arguments[1]))
+        publish(
+            Path(arguments[0]),
+            Path(arguments[1]),
+            options.get("--parent-identity"),
+            options.get("--source-identity"),
+            options.get("--source-sha256"),
+        )
     except (PublishError, OSError) as error:
         print(f"cccc publish: {error}", file=sys.stderr)
         return PUBLISH_ERROR

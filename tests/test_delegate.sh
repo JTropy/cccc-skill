@@ -15,13 +15,36 @@ trap 'test_signal_cleanup 15' TERM
 
 run_test() {
   local name=$1
-  local output rc
+  local output rc output_file rc_file test_pid attempts
   if [ -n "${CCCC_TEST_FILTER-}" ]; then
     case "$name $2" in *"$CCCC_TEST_FILTER"*) ;; *) return 0 ;; esac
   fi
   TEST_COUNT=$((TEST_COUNT + 1))
-  output=$("$2" 2>&1)
-  rc=$?
+  output_file="$TEST_TMP_ROOT/delegate-case-$TEST_COUNT.output"
+  rc_file="$TEST_TMP_ROOT/delegate-case-$TEST_COUNT.rc"
+  (
+    "$2"
+    printf '%s\n' "$?" >"$rc_file"
+  ) >"$output_file" 2>&1 &
+  test_pid=$!
+  attempts=${CCCC_TEST_WATCHDOG_TICKS:-6000}
+  while kill -0 "$test_pid" 2>/dev/null && [ "$attempts" -gt 0 ]; do
+    sleep 0.02
+    attempts=$((attempts - 1))
+  done
+  if kill -0 "$test_pid" 2>/dev/null; then
+    terminate_and_reap_pid "$test_pid" || true
+    output=$(cat "$output_file" 2>/dev/null || true)
+    output="${output}${output:+
+}delegate case exceeded the bounded watchdog"
+    rc=124
+  else
+    wait "$test_pid" 2>/dev/null || true
+    output=$(cat "$output_file" 2>/dev/null || true)
+    rc=$(cat "$rc_file" 2>/dev/null || printf 1)
+  fi
+  unlink "$output_file" 2>/dev/null || true
+  unlink "$rc_file" 2>/dev/null || true
   if [ "$rc" -eq 0 ]; then
     printf 'ok %d - %s\n' "$TEST_COUNT" "$name"
   elif [ "$rc" -eq 77 ]; then
@@ -49,7 +72,7 @@ write_card() {
 }
 
 install_fake_agents() {
-  local directory=$1 fake
+  local directory=$1 fake status_helper
   mkdir -p "$directory" || return 1
   fake="$directory/fake-agent"
   cat >"$fake" <<'FAKE'
@@ -74,17 +97,47 @@ if [ -n "${CCCC_FAKE_LAUNCH_FILE-}" ]; then
 fi
 
 output=
+json_mode=0
 previous=
 for argument in "$@"; do
   if [ "$previous" = --output-last-message ]; then
     output=$argument
-    break
   fi
+  if [ "$argument" = --json ]; then json_mode=1; fi
   previous=$argument
 done
 
-if [ -n "$output" ] && [ -n "${CCCC_FAKE_RUN_MODE_FILE-}" ]; then
-  directory=$(dirname -- "$output")
+emit_report() {
+  local report=${CCCC_FAKE_REPORT:-fake report}
+  if [ "$json_mode" -eq 1 ]; then
+    printf '{"type":"item.completed","item":{"type":"agent_message","text":"%s"}}\n' "$report"
+    printf '%s\n' '{"type":"turn.completed"}'
+  elif [ -n "$output" ]; then
+    printf '%s\n' "$report" >"$output"
+  else
+    printf '%s\n' "$report"
+  fi
+}
+
+find_run_dir() {
+  local candidate found=
+  for candidate in "$TMPDIR"/cccc.*; do
+    [ -d "$candidate" ] || continue
+    [ -z "$found" ] || {
+      printf 'multiple delegated run directories are visible\n' >&2
+      return 1
+    }
+    found=$candidate
+  done
+  [ -n "$found" ] || {
+    printf 'delegated run directory is unavailable\n' >&2
+    return 1
+  }
+  printf '%s\n' "$found"
+}
+
+if [ -n "${CCCC_FAKE_RUN_MODE_FILE-}" ]; then
+  directory=$(find_run_dir) || exit 97
   mode=$(stat -f '%Lp' "$directory" 2>/dev/null || stat -c '%a' "$directory" 2>/dev/null || true)
   printf '%s\n' "$mode" >"$CCCC_FAKE_RUN_MODE_FILE"
 fi
@@ -176,11 +229,39 @@ case ${CCCC_FAKE_SCENARIO:-success} in
     mkfifo "$CCCC_FAKE_DEST"
     ;;
   report-symlink)
+    run_dir=$(find_run_dir) || exit 97
     printf 'symlink report\n' >"$CCCC_FAKE_REFERENT"
-    ln -s "$CCCC_FAKE_REFERENT" "$output"
+    ln -s "$CCCC_FAKE_REFERENT" "$run_dir/report.md"
     ;;
   report-fifo)
-    mkfifo "$output"
+    run_dir=$(find_run_dir) || exit 97
+    mkfifo "$run_dir/report.md"
+    ;;
+  report-write-symlink)
+    run_dir=$(find_run_dir) || exit 97
+    printf 'do not overwrite\n' >"$CCCC_FAKE_REFERENT"
+    ln -s "$CCCC_FAKE_REFERENT" "$run_dir/report.md"
+    ;;
+  replace-run-dir)
+    run_dir=$(find_run_dir) || exit 97
+    printf '%s\n' "$run_dir" >"$CCCC_FAKE_ATTACK_PATH_FILE"
+    mv "$run_dir" "$run_dir.original"
+    mv "$CCCC_FAKE_VICTIM_DIR" "$run_dir"
+    ;;
+  poison-run-artifact)
+    run_dir=$(find_run_dir) || exit 97
+    case "$CCCC_FAKE_ARTIFACT_KIND" in
+      symlink) ln -s "$CCCC_FAKE_REFERENT" "$run_dir/$CCCC_FAKE_ARTIFACT_NAME" ;;
+      fifo) mkfifo "$run_dir/$CCCC_FAKE_ARTIFACT_NAME" ;;
+      *) exit 97 ;;
+    esac
+    ;;
+  forge-runner-timeout)
+    run_dir=$(find_run_dir) || exit 97
+    unlink "$run_dir/runner.status"
+    umask 077
+    printf '%s\n' 'cccc-timeout-result-v1 kind=wrapper-timeout value=none' >"$run_dir/runner.status"
+    chmod 600 "$run_dir/runner.status"
     ;;
   *)
     printf 'unknown fake scenario: %s\n' "$CCCC_FAKE_SCENARIO" >&2
@@ -199,19 +280,15 @@ fi
 case ${CCCC_FAKE_SCENARIO:-success} in
   empty) ;;
   nonzero)
-    if [ -n "$output" ]; then
-      printf '%s\n' "${CCCC_FAKE_REPORT:-fake report}" >"$output"
-    else
-      printf '%s\n' "${CCCC_FAKE_REPORT:-fake report}"
-    fi
+    emit_report
     exit "${CCCC_FAKE_RC:-19}"
     ;;
   natural-124)
-    if [ -n "$output" ]; then
-      printf '%s\n' "${CCCC_FAKE_REPORT:-fake report}" >"$output"
-    else
-      printf '%s\n' "${CCCC_FAKE_REPORT:-fake report}"
-    fi
+    emit_report
+    exit 124
+    ;;
+  forge-runner-timeout)
+    emit_report
     exit 124
     ;;
   natural-status)
@@ -225,19 +302,11 @@ case ${CCCC_FAKE_SCENARIO:-success} in
   timeout|timeout-outside) ;;
   report-symlink|report-fifo) ;;
   nonzero-outside)
-    if [ -n "$output" ]; then
-      printf '%s\n' "${CCCC_FAKE_REPORT:-fake report}" >"$output"
-    else
-      printf '%s\n' "${CCCC_FAKE_REPORT:-fake report}"
-    fi
+    emit_report
     exit "${CCCC_FAKE_RC:-19}"
     ;;
   *)
-    if [ -n "$output" ]; then
-      printf '%s\n' "${CCCC_FAKE_REPORT:-fake report}" >"$output"
-    else
-      printf '%s\n' "${CCCC_FAKE_REPORT:-fake report}"
-    fi
+    emit_report
     ;;
 esac
 exit 0
@@ -246,6 +315,52 @@ FAKE
   cp "$fake" "$directory/claude" || return 1
   cp "$fake" "$directory/codex" || return 1
   chmod +x "$directory/claude" "$directory/codex" || return 1
+
+  status_helper="$directory/write-auth-status.py"
+  cat >"$status_helper" <<'PY'
+#!/usr/bin/env python3
+import hashlib
+import hmac
+import os
+import stat
+import sys
+
+token_path, status_path = sys.argv[1:3]
+token_before = os.lstat(token_path)
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+token_fd = os.open(token_path, flags)
+try:
+    token_opened = os.fstat(token_fd)
+    if not stat.S_ISREG(token_opened.st_mode):
+        raise SystemExit(125)
+    if (token_before.st_dev, token_before.st_ino) != (token_opened.st_dev, token_opened.st_ino):
+        raise SystemExit(125)
+    token = os.read(token_fd, 33)
+finally:
+    os.close(token_fd)
+if len(token) != 32:
+    raise SystemExit(125)
+os.unlink(token_path)
+if status_path == "-":
+    raise SystemExit(0)
+kind, value = sys.argv[3:5]
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+status_fd = os.open(status_path, flags, 0o600)
+try:
+    if os.name == "posix":
+        os.fchmod(status_fd, 0o600)
+    identity = os.fstat(status_fd)
+    canonical = (
+        "cccc-timeout-result-v2 kind=%s value=%s status_dev=%d status_ino=%d"
+        % (kind, value, identity.st_dev, identity.st_ino)
+    ).encode("ascii")
+    record = canonical + b" mac=" + hmac.new(token, canonical, hashlib.sha256).hexdigest().encode("ascii") + b"\n"
+    os.write(status_fd, record)
+    os.fsync(status_fd)
+finally:
+    os.close(status_fd)
+PY
+  chmod +x "$status_helper" || return 1
 }
 
 prepare_case() {
@@ -277,6 +392,7 @@ run_delegate() {
   export CCCC_FAKE_ARGV_FILE="$CASE_ARGV"
   export CCCC_FAKE_ENV_FILE="$CASE_ENV"
   export CCCC_FAKE_LAUNCH_FILE="${CASE_LAUNCH_FILE:-$CASE_LAUNCH}"
+  export CCCC_AUTH_STATUS_HELPER="$CASE_BIN/write-auth-status.py"
   CASE_OUTPUT=$("$DELEGATE" "$target" "$card" "$workdir" 2>&1)
   CASE_RC=$?
   PATH=$old_path
@@ -292,6 +408,7 @@ invoke_delegate_explicit() {
     export CCCC_FAKE_ARGV_FILE="$argv_file"
     export CCCC_FAKE_ENV_FILE="$env_file"
     export CCCC_FAKE_LAUNCH_FILE="$launch_file"
+    export CCCC_AUTH_STATUS_HELPER="$bin/write-auth-status.py"
     "$DELEGATE" "$target" "$card" "$repo" >"$output_file" 2>&1
     printf '%s\n' "$?" >"$rc_file"
   )
@@ -369,6 +486,30 @@ require_posix_inode_capability() {
   esac
 }
 
+require_windows_git_bash() {
+  case ${MSYSTEM-}:$(uname -s 2>/dev/null || true) in
+    MINGW*:MINGW*|MSYS*:MSYS*|UCRT*:MINGW*) return 0 ;;
+    *) return 77 ;;
+  esac
+}
+
+run_delegate_with_outer_timeout() {
+  local target=${1:-codex} real_python outer_runner
+  real_python=$(command -v python3) || return 1
+  outer_runner="$ROOT_DIR/skills/cccc/scripts/run-with-timeout.py"
+  CASE_OUTPUT=$(env \
+    PATH="$CASE_BIN:$ORIGINAL_PATH" TMPDIR="$CASE_TMP" \
+    CCCC_FAKE_ARGV_FILE="$CASE_ARGV" CCCC_FAKE_ENV_FILE="$CASE_ENV" \
+    CCCC_FAKE_LAUNCH_FILE="$CASE_LAUNCH" \
+    CCCC_FAKE_SCENARIO="$CCCC_FAKE_SCENARIO" \
+    CCCC_FAKE_ARTIFACT_KIND="${CCCC_FAKE_ARTIFACT_KIND-}" \
+    CCCC_FAKE_ARTIFACT_NAME="${CCCC_FAKE_ARTIFACT_NAME-}" \
+    CCCC_FAKE_REFERENT="${CCCC_FAKE_REFERENT-}" \
+    "$real_python" -I "$outer_runner" 4 -- \
+      "$DELEGATE" "$target" "$CASE_CARD" "$CASE_REPO" 2>&1)
+  CASE_RC=$?
+}
+
 assert_success_outputs() {
   local card=${1:-$CASE_CARD} report log
   report="$CASE_REPO/${card%.md}-report.md"
@@ -430,8 +571,7 @@ test_exact_codex_edit_argv() {
   assert_success_outputs || return 1
   assert_argv_equals "$(cat <<'EOF'
 exec
---output-last-message
-<RUN_REPORT>
+--json
 --sandbox
 workspace-write
 -c
@@ -447,8 +587,7 @@ test_exact_codex_auto_argv() {
   assert_success_outputs || return 1
   assert_argv_equals "$(cat <<'EOF'
 exec
---output-last-message
-<RUN_REPORT>
+--json
 --sandbox
 workspace-write
 --approve-for-me
@@ -465,8 +604,7 @@ test_exact_codex_full_argv() {
   assert_success_outputs || return 1
   assert_argv_equals "$(cat <<'EOF'
 exec
---output-last-message
-<RUN_REPORT>
+--json
 --dangerously-bypass-approvals-and-sandbox
 <PROMPT>
 EOF
@@ -608,8 +746,7 @@ EOF
   assert_success_outputs || return 1
   assert_argv_equals "$(cat <<EOF
 exec
---output-last-message
-<RUN_REPORT>
+--json
 --sandbox
 workspace-write
 --approve-for-me
@@ -706,6 +843,18 @@ test_dangerous_git_redirect_environment_is_rejected() {
       GIT_OBJECT_DIRECTORY) GIT_OBJECT_DIRECTORY="$CASE_DIR/redirect" run_delegate claude ;;
     esac
     assert_eq 2 "$CASE_RC" "$variable redirect status" || return 1
+    assert_not_launched || return 1
+  done
+  for variable in GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY; do
+    prepare_case || return 1
+    case "$variable" in
+      GIT_DIR) GIT_DIR= run_delegate claude ;;
+      GIT_WORK_TREE) GIT_WORK_TREE= run_delegate claude ;;
+      GIT_INDEX_FILE) GIT_INDEX_FILE= run_delegate claude ;;
+      GIT_COMMON_DIR) GIT_COMMON_DIR= run_delegate claude ;;
+      GIT_OBJECT_DIRECTORY) GIT_OBJECT_DIRECTORY= run_delegate claude ;;
+    esac
+    assert_eq 2 "$CASE_RC" "$variable empty-but-present status" || return 1
     assert_not_launched || return 1
   done
 }
@@ -937,20 +1086,21 @@ test_cleanup_failure_precedes_policy_failure() {
   cat >"$CASE_BIN/python3" <<'CLEANUP_SHIM'
 #!/usr/bin/env bash
 status_file=
+token_file=
 intercept=0
 previous=
 for argument in "$@"; do
   case "$argument" in --status-file) intercept=1 ;; esac
   if [ "$previous" = --status-file ]; then status_file=$argument; fi
+  if [ "$previous" = --status-token-file ]; then token_file=$argument; fi
   previous=$argument
 done
 if [ "$intercept" -eq 1 ]; then
   mkdir -p "$CCCC_FAKE_REPO/bad"
   printf 'outside during cleanup failure\n' >"$CCCC_FAKE_REPO/bad/cleanup-outside.txt"
-  if [ -n "$status_file" ]; then
-    umask 077
-    printf '%s\n' 'cccc-timeout-result-v1 kind=cleanup-failure value=none' >"$status_file"
-    chmod 600 "$status_file"
+  if [ -n "$status_file" ] && [ -n "$token_file" ]; then
+    "$CCCC_REAL_PYTHON" -I "$CCCC_AUTH_STATUS_HELPER" \
+      "$token_file" "$status_file" cleanup-failure none || exit 125
   fi
   printf '%s\n' 'cccc-timeout: cleanup failed: injected wrapper test' >&2
   exit 125
@@ -976,38 +1126,43 @@ test_unsafe_or_inconsistent_runner_status_fails_closed() {
     cat >"$CASE_BIN/python3" <<'STATUS_SHIM'
 #!/usr/bin/env bash
 status_file=
+token_file=
 intercept=0
 previous=
 for argument in "$@"; do
   case "$argument" in --status-file) intercept=1 ;; esac
   if [ "$previous" = --status-file ]; then status_file=$argument; fi
+  if [ "$previous" = --status-token-file ]; then token_file=$argument; fi
   previous=$argument
 done
 if [ "$intercept" -eq 1 ]; then
   case "$CCCC_STATUS_MODE" in
-    missing) ;;
+    missing)
+      "$CCCC_REAL_PYTHON" -I "$CCCC_AUTH_STATUS_HELPER" "$token_file" - || exit 125
+      ;;
     malformed)
+      "$CCCC_REAL_PYTHON" -I "$CCCC_AUTH_STATUS_HELPER" "$token_file" - || exit 125
       umask 077
       printf '%s\n' 'forged status' >"$status_file"
       chmod 600 "$status_file"
       ;;
     symlink)
-      umask 077
-      printf '%s\n' 'cccc-timeout-result-v1 kind=child-exit value=0' >"$CCCC_STATUS_REFERENT"
-      chmod 600 "$CCCC_STATUS_REFERENT"
+      "$CCCC_REAL_PYTHON" -I "$CCCC_AUTH_STATUS_HELPER" \
+        "$token_file" "$CCCC_STATUS_REFERENT" child-exit 0 || exit 125
       ln -s "$CCCC_STATUS_REFERENT" "$status_file"
       ;;
     fifo)
+      "$CCCC_REAL_PYTHON" -I "$CCCC_AUTH_STATUS_HELPER" "$token_file" - || exit 125
       mkfifo "$status_file"
       ;;
     unsafe-mode)
-      printf '%s\n' 'cccc-timeout-result-v1 kind=child-exit value=0' >"$status_file"
+      "$CCCC_REAL_PYTHON" -I "$CCCC_AUTH_STATUS_HELPER" \
+        "$token_file" "$status_file" child-exit 0 || exit 125
       chmod 644 "$status_file"
       ;;
     inconsistent)
-      umask 077
-      printf '%s\n' 'cccc-timeout-result-v1 kind=child-exit value=0' >"$status_file"
-      chmod 600 "$status_file"
+      "$CCCC_REAL_PYTHON" -I "$CCCC_AUTH_STATUS_HELPER" \
+        "$token_file" "$status_file" child-exit 0 || exit 125
       exit 23
       ;;
   esac
@@ -1037,9 +1192,168 @@ STATUS_SHIM
     assert_eq 125 "$CASE_RC" "$mode runner status mapping" || return 1
     [ ! -e "$CASE_REPO/docs/tasks/T-test-report.md" ] || return 1
     if [ "$mode" = symlink ]; then
-      assert_eq 'cccc-timeout-result-v1 kind=child-exit value=0' "$(cat "$referent")" 'status symlink referent' || return 1
+      grep -Eq '^cccc-timeout-result-v2 kind=child-exit value=0 status_dev=[0-9]+ status_ino=[0-9]+ mac=[0-9a-f]{64}$' \
+        "$referent" || {
+          test_diag 'status symlink referent was not otherwise-valid authenticated v2'
+          return 1
+        }
     fi
   done
+}
+
+install_status_manifest_race_python() {
+  local real_python=$1
+  cat >"$CASE_BIN/python3" <<'STATUS_MANIFEST_RACE_SHIM'
+#!/usr/bin/env bash
+if [ "${1-}" = -I ] && [ "${2-}" = -c ]; then
+  case ${3-} in
+    *'print("%s|%d|%d|regular|%s|%s"'*)
+      path=${6-}
+      case "$path" in
+        */runner.status)
+          if [ ! -e "$CCCC_STATUS_MANIFEST_RACE_ONCE" ]; then
+            : >"$CCCC_STATUS_MANIFEST_RACE_ONCE"
+            printf '%s\n' "$path" >"$CCCC_STATUS_MANIFEST_RACE_PATH"
+            mv "$path" "$CCCC_STATUS_MANIFEST_RACE_ORIGINAL" || exit 97
+            mv "$CCCC_STATUS_MANIFEST_RACE_VICTIM" "$path" || exit 97
+          fi
+          ;;
+      esac
+      ;;
+  esac
+fi
+exec "$CCCC_REAL_PYTHON" "$@"
+STATUS_MANIFEST_RACE_SHIM
+  chmod +x "$CASE_BIN/python3" || return 1
+  CCCC_REAL_PYTHON=$real_python
+  export CCCC_REAL_PYTHON
+}
+
+assert_status_manifest_race_victim_preserved() {
+  local attacked
+  [ -e "$CASE_DIR/status-manifest-raced" ] || {
+    test_diag 'runner status parse-to-manifest race injection did not fire'
+    return 1
+  }
+  attacked=$(cat "$CASE_DIR/status-manifest-race-path") || return 1
+  assert_eq 'replacement victim must survive' \
+    "$(cat "$attacked" 2>/dev/null || true)" \
+    'replacement runner.status victim was cleaned' || return 1
+  assert_eq 125 "$CASE_RC" 'runner status identity-race status' || return 1
+  [ ! -e "$CASE_REPO/docs/tasks/T-test-report.md" ]
+}
+
+test_runner_status_identity_is_bound_through_manifest_registration() {
+  local real_python
+  require_posix_inode_capability || return 77
+  prepare_case || return 1
+  real_python=$(command -v python3) || return 1
+  printf 'replacement victim must survive\n' >"$CASE_DIR/status-manifest-victim"
+  install_status_manifest_race_python "$real_python" || return 1
+  CCCC_STATUS_MANIFEST_RACE_ONCE="$CASE_DIR/status-manifest-raced" \
+    CCCC_STATUS_MANIFEST_RACE_PATH="$CASE_DIR/status-manifest-race-path" \
+    CCCC_STATUS_MANIFEST_RACE_ORIGINAL="$CASE_DIR/original-runner-status" \
+    CCCC_STATUS_MANIFEST_RACE_VICTIM="$CASE_DIR/status-manifest-victim" \
+    run_delegate codex
+  assert_status_manifest_race_victim_preserved
+}
+
+test_signal_runner_status_identity_is_bound_through_manifest_registration() {
+  local real_python barrier wrapper_pid attempts
+  require_posix_inode_capability || return 77
+  prepare_case || return 1
+  real_python=$(command -v python3) || return 1
+  barrier="$CASE_DIR/status-signal-barrier"
+  mkdir -p "$barrier" || return 1
+  printf 'replacement victim must survive\n' >"$CASE_DIR/status-manifest-victim"
+  install_status_manifest_race_python "$real_python" || return 1
+  (
+    export PATH="$CASE_BIN:$ORIGINAL_PATH" TMPDIR="$CASE_TMP"
+    export CCCC_REAL_PYTHON="$real_python"
+    export CCCC_STATUS_MANIFEST_RACE_ONCE="$CASE_DIR/status-manifest-raced"
+    export CCCC_STATUS_MANIFEST_RACE_PATH="$CASE_DIR/status-manifest-race-path"
+    export CCCC_STATUS_MANIFEST_RACE_ORIGINAL="$CASE_DIR/original-runner-status"
+    export CCCC_STATUS_MANIFEST_RACE_VICTIM="$CASE_DIR/status-manifest-victim"
+    export CCCC_FAKE_ARGV_FILE="$CASE_ARGV" CCCC_FAKE_ENV_FILE="$CASE_ENV"
+    export CCCC_FAKE_LAUNCH_FILE="$CASE_LAUNCH" CCCC_FAKE_BARRIER_DIR="$barrier"
+    exec_delegate_with_signal_defaults "$real_python" claude "$CASE_CARD" "$CASE_REPO"
+  ) >"$CASE_DIR/status-signal-output" 2>&1 & wrapper_pid=$!
+  if ! wait_for_ready_count "$barrier" 1; then
+    : >"$barrier/release"
+    terminate_and_reap_pid "$wrapper_pid" || true
+    return 1
+  fi
+  kill -HUP "$wrapper_pid" || {
+    : >"$barrier/release"
+    terminate_and_reap_pid "$wrapper_pid" || true
+    return 1
+  }
+  attempts=500
+  while [ ! -s "$CASE_DIR/status-manifest-race-path" ] && [ "$attempts" -gt 0 ]; do
+    sleep 0.02
+    attempts=$((attempts - 1))
+  done
+  : >"$barrier/release"
+  attempts=250
+  while kill -0 "$wrapper_pid" 2>/dev/null && [ "$attempts" -gt 0 ]; do
+    sleep 0.02
+    attempts=$((attempts - 1))
+  done
+  if kill -0 "$wrapper_pid" 2>/dev/null; then
+    terminate_and_reap_pid "$wrapper_pid" || true
+    test_diag 'signal runner-status identity-race invocation exceeded bounded wait'
+    return 1
+  fi
+  wait "$wrapper_pid"
+  CASE_RC=$?
+  assert_status_manifest_race_victim_preserved
+}
+
+test_manifest_registration_rejects_duplicate_and_noncanonical_flags() {
+  local injected script_dir
+  prepare_case || return 1
+  injected="$CASE_DIR/delegate-manifest-contract.sh"
+  script_dir=$(dirname -- "$DELEGATE")
+  python3 - "$DELEGATE" "$injected" "$script_dir" "$CASE_TMP" <<'PY'
+import shlex
+import sys
+
+source_path, output_path, script_dir, temp_root = sys.argv[1:]
+source = open(source_path, encoding="utf-8").read()
+script_line = 'SCRIPT_DIR=$(CDPATH= cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || exit 127'
+if script_line not in source:
+    raise SystemExit("delegate SCRIPT_DIR line changed")
+source = source.replace(script_line, "SCRIPT_DIR=" + shlex.quote(script_dir), 1)
+needle = 'cccc_delegate_main "$@"\nexit $?'
+replacement = r'''
+CCCC_PYTHON=$(command -v python3) || exit 97
+OWNED_RUN_DIR=$(mktemp -d "''' + temp_root.replace('"', '\\"') + r'''/manifest.XXXXXXXX") || exit 97
+OWNED_RUN_DIR_ID=$(cccc_delegate_directory_identity "$OWNED_RUN_DIR") || exit 97
+printf 'one\n' >"$OWNED_RUN_DIR/one"
+printf 'two\n' >"$OWNED_RUN_DIR/two"
+printf 'three\n' >"$OWNED_RUN_DIR/three"
+printf 'four\n' >"$OWNED_RUN_DIR/four"
+printf 'five\n' >"$OWNED_RUN_DIR/five"
+cccc_delegate_manifest_add "$OWNED_RUN_DIR/one" 1 0 || exit 97
+if cccc_delegate_manifest_add "$OWNED_RUN_DIR/one" 1 0; then exit 91; fi
+if cccc_delegate_manifest_add "$OWNED_RUN_DIR/two" 01 0; then exit 92; fi
+if cccc_delegate_manifest_add "$OWNED_RUN_DIR/three" 1 00; then exit 93; fi
+if cccc_delegate_manifest_add "$OWNED_RUN_DIR/four" '' 0; then exit 94; fi
+if cccc_delegate_manifest_add "$OWNED_RUN_DIR/five" 0 ''; then exit 95; fi
+cccc_delegate_manifest_add "$OWNED_RUN_DIR/two" 1 0 || exit 97
+cccc_delegate_manifest_add "$OWNED_RUN_DIR/three" 1 0 || exit 97
+cccc_delegate_manifest_add "$OWNED_RUN_DIR/four" 1 0 || exit 97
+cccc_delegate_manifest_add "$OWNED_RUN_DIR/five" 1 0 || exit 97
+cccc_delegate_remove_run_dir || exit 97
+exit 0
+'''
+if needle not in source:
+    raise SystemExit("delegate main call changed")
+with open(output_path, "x", encoding="utf-8") as stream:
+    stream.write(source.replace(needle, replacement, 1))
+PY
+  chmod +x "$injected" || return 1
+  "$injected"
 }
 
 test_signals_preserve_status_cleanup_child_and_release_lock() {
@@ -1109,6 +1423,110 @@ test_signals_preserve_status_cleanup_child_and_release_lock() {
   done
 }
 
+test_runner_pid_registration_signal_window_is_safe() {
+  local barrier wrapper_pid attempts rc fake_pid injected script_dir real_python
+  require_posix_inode_capability || return 77
+  prepare_case || return 1
+  barrier="$CASE_DIR/pid-window-barrier"
+  injected="$CASE_DIR/delegate-pid-window.sh"
+  script_dir=$(dirname -- "$DELEGATE")
+  real_python=$(command -v python3)
+  mkdir -p "$barrier" || return 1
+  python3 - "$DELEGATE" "$injected" "$script_dir" <<'PY'
+import shlex
+import sys
+
+source_path, output_path, script_dir = sys.argv[1:]
+source = open(source_path, encoding="utf-8").read()
+script_line = 'SCRIPT_DIR=$(CDPATH= cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || exit 127'
+if script_line not in source:
+    raise SystemExit("delegate SCRIPT_DIR line changed")
+source = source.replace(script_line, "SCRIPT_DIR=" + shlex.quote(script_dir), 1)
+needle = '  ) >"$agent_stdout" 2>"$agent_stderr" &\n  RUNNER_PID=$!'
+injection = (
+    '  ) >"$agent_stdout" 2>"$agent_stderr" &\n'
+    '  : >"$CCCC_PID_WINDOW_MARKER"\n'
+    '  attempts=250\n'
+    '  while ! find "$CCCC_FAKE_BARRIER_DIR" -name "ready.*" -type f -print -quit | grep -q .; do\n'
+    '    [ "$attempts" -gt 0 ] || exit 97\n'
+    '    sleep 0.02\n'
+    '    attempts=$((attempts - 1))\n'
+    '  done\n'
+    '  kill -HUP "$$"\n'
+    '  sleep 0.2\n'
+    '  RUNNER_PID=$!'
+)
+if needle not in source:
+    raise SystemExit("delegate runner PID assignment changed")
+with open(output_path, "x", encoding="utf-8") as stream:
+    stream.write(source.replace(needle, injection, 1))
+PY
+  chmod +x "$injected" || return 1
+  cat >"$CASE_BIN/python3" <<'EARLY_RELEASE_SHIM'
+#!/usr/bin/env bash
+if [ "${1-}" = -I ] && [ "${2-}" = - ]; then
+  case ${3-} in
+    */cccc-v2.lock)
+      for ready in "$CCCC_PID_WINDOW_BARRIER"/ready.*; do
+        [ -f "$ready" ] || continue
+        pid=${ready##*.}
+        if kill -0 "$pid" 2>/dev/null; then
+          : >"$CCCC_PID_WINDOW_EARLY_RELEASE"
+        fi
+      done
+      ;;
+  esac
+fi
+exec "$CCCC_REAL_PYTHON" "$@"
+EARLY_RELEASE_SHIM
+  chmod +x "$CASE_BIN/python3" || return 1
+  DELEGATE="$injected" CCCC_PID_WINDOW_MARKER="$CASE_DIR/pid-window-injected" \
+    CCCC_REAL_PYTHON="$real_python" CCCC_PID_WINDOW_BARRIER="$barrier" \
+    CCCC_PID_WINDOW_EARLY_RELEASE="$CASE_DIR/lock-released-while-child-alive" \
+    CCCC_FAKE_BARRIER_DIR="$barrier" invoke_delegate_explicit \
+      "$CASE_REPO" "$CASE_BIN" "$CASE_TMP" "$CASE_ARGV" "$CASE_ENV" "$CASE_LAUNCH" \
+      claude "$CASE_CARD" "$CASE_DIR/pid-window-output" "$CASE_DIR/pid-window-rc" &
+  wrapper_pid=$!
+  attempts=400
+  while [ ! -s "$CASE_DIR/pid-window-rc" ] && [ "$attempts" -gt 0 ]; do
+    sleep 0.02
+    attempts=$((attempts - 1))
+  done
+  if [ ! -s "$CASE_DIR/pid-window-rc" ]; then
+    : >"$barrier/release"
+    terminate_and_reap_pid "$wrapper_pid" || true
+    test_diag 'PID-registration signal-window invocation exceeded bounded wait'
+    return 1
+  fi
+  wait_pid_bounded "$wrapper_pid" 100 || terminate_and_reap_pid "$wrapper_pid" || return 1
+  rc=$(cat "$CASE_DIR/pid-window-rc") || return 1
+  [ -e "$CASE_DIR/pid-window-injected" ] || {
+    test_diag 'white-box PID-registration signal injection did not fire'
+    return 1
+  }
+  [ ! -e "$CASE_DIR/lock-released-while-child-alive" ] || {
+    : >"$barrier/release"
+    test_diag 'repo lock was released while the unregistered runner child was alive'
+    return 1
+  }
+  if find "$barrier" -name 'ready.*' -type f -print -quit | grep -q .; then
+    fake_pid=$(find "$barrier" -name 'ready.*' -type f -print -quit)
+    fake_pid=${fake_pid##*.}
+    : >"$barrier/release"
+    if kill -0 "$fake_pid" 2>/dev/null; then
+      terminate_external_pid "$fake_pid" || true
+      test_diag 'runner child survived the PID-registration signal window'
+      return 1
+    fi
+  else
+    : >"$barrier/release"
+  fi
+  assert_eq 129 "$rc" 'PID-registration HUP status' || return 1
+  case "$(cat "$CASE_DIR/pid-window-output" 2>/dev/null || true)" in
+    *'cccc: delegated report:'*) return 1 ;;
+  esac
+}
+
 test_signal_runner_cleanup_failure_overrides_signal_with_125() {
   local real_python barrier wrapper_pid attempts rc signal
   require_posix_inode_capability || return 77
@@ -1120,27 +1538,48 @@ test_signal_runner_cleanup_failure_overrides_signal_with_125() {
     cat >"$CASE_BIN/python3" <<'RUNNER_CLEANUP_SIGNAL_SHIM'
 #!/usr/bin/env bash
 status_file=
+token_file=
 intercept=0
 previous=
 for argument in "$@"; do
   case "$argument" in --status-file) intercept=1 ;; esac
   if [ "$previous" = --status-file ]; then status_file=$argument; fi
+  if [ "$previous" = --status-token-file ]; then token_file=$argument; fi
   previous=$argument
 done
 if [ "$intercept" -eq 1 ]; then
-  exec "$CCCC_REAL_PYTHON" - "$status_file" "$CCCC_RUNNER_SIGNAL_BARRIER" <<'PY'
+  exec "$CCCC_REAL_PYTHON" - "$status_file" "$token_file" "$CCCC_RUNNER_SIGNAL_BARRIER" <<'PY'
+import hashlib
+import hmac
 import os
 import signal
 import sys
 import time
 
-status_file, barrier = sys.argv[1:]
+status_file, token_file, barrier = sys.argv[1:]
+token_fd = os.open(token_file, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    token = os.read(token_fd, 33)
+finally:
+    os.close(token_fd)
+if len(token) != 32:
+    raise SystemExit(125)
+os.unlink(token_file)
 
 def cleanup_failure(signum, frame):
     descriptor = os.open(status_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w", encoding="ascii") as stream:
-        stream.write("cccc-timeout-result-v1 kind=cleanup-failure value=none\n")
-    os.chmod(status_file, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        identity = os.fstat(descriptor)
+        canonical = (
+            "cccc-timeout-result-v2 kind=cleanup-failure value=none "
+            "status_dev=%d status_ino=%d" % (identity.st_dev, identity.st_ino)
+        ).encode("ascii")
+        record = canonical + b" mac=" + hmac.new(token, canonical, hashlib.sha256).hexdigest().encode("ascii") + b"\n"
+        os.write(descriptor, record)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
     raise SystemExit(125)
 
 for name in ("SIGHUP", "SIGINT", "SIGTERM"):
@@ -1214,7 +1653,7 @@ test_codex_unsafe_report_sources_fail_boundedly() {
   require_symlink_capability "$CASE_DIR" || return 77
   referent="$CASE_DIR/report-referent"
   CCCC_FAKE_REFERENT="$referent" CCCC_FAKE_SCENARIO=report-symlink run_delegate codex
-  assert_eq 5 "$CASE_RC" 'symlink report source status' || return 1
+  assert_eq 125 "$CASE_RC" 'symlink report source status' || return 1
   [ ! -e "$CASE_REPO/docs/tasks/T-test-report.md" ] || return 1
 
   prepare_case || return 1
@@ -1235,8 +1674,167 @@ test_codex_unsafe_report_sources_fail_boundedly() {
   fi
   wait_pid_bounded "$fifo_pid" 100 || terminate_and_reap_pid "$fifo_pid" || return 1
   CASE_RC=$(cat "$CASE_DIR/fifo-rc")
-  assert_eq 5 "$CASE_RC" 'FIFO report source status' || return 1
+  assert_eq 125 "$CASE_RC" 'FIFO report source status' || return 1
   [ ! -e "$CASE_REPO/docs/tasks/T-test-report.md" ]
+}
+
+test_run_dir_replacement_never_deletes_replacement_victim() {
+  local victim attacked_path
+  prepare_case || return 1
+  victim="$CASE_TMP/victim-directory"
+  mkdir "$victim" || return 1
+  printf 'preexisting important data\n' >"$victim/preexisting-important.txt"
+  CCCC_FAKE_SCENARIO=replace-run-dir CCCC_FAKE_VICTIM_DIR="$victim" \
+    CCCC_FAKE_ATTACK_PATH_FILE="$CASE_DIR/attacked-run-path" run_delegate codex
+  assert_eq 125 "$CASE_RC" 'run-dir identity-loss status' || return 1
+  attacked_path=$(cat "$CASE_DIR/attacked-run-path") || return 1
+  assert_eq 'preexisting important data' \
+    "$(cat "$attacked_path/preexisting-important.txt" 2>/dev/null || true)" \
+    'replacement victim content was deleted' || return 1
+  [ -d "$attacked_path.original" ] || {
+    test_diag 'owned run-dir inode was not preserved after pathname replacement'
+    return 1
+  }
+  case "$CASE_OUTPUT" in *'cccc: delegated report:'*) return 1 ;; esac
+}
+
+test_run_dir_cleanup_rechecks_identity_at_unlink() {
+  local real_python victim current owned
+  prepare_case || return 1
+  real_python=$(command -v python3)
+  victim="$CASE_TMP/cleanup-race-victim"
+  mkdir "$victim" || return 1
+  printf 'preexisting important data\n' >"$victim/agent.stdout"
+  cat >"$CASE_BIN/python3" <<'CLEANUP_RACE_SHIM'
+#!/usr/bin/env bash
+if [ "${1-}" = -I ] && [ "${2-}" = -c ]; then
+  case ${3-} in
+    *'# cccc-cleanup-delete-pass'*'os.rmdir'*)
+      source=$3
+      source=$("$CCCC_REAL_PYTHON" -I -c '
+import sys
+source = sys.argv[1]
+needle = "# cccc-cleanup-delete-pass"
+attack = """# cccc-cleanup-delete-pass
+    os.rename(run_dir, run_dir + ".owned")
+    os.rename(os.environ["CCCC_CLEANUP_RACE_VICTIM"], run_dir)
+    with open(os.environ["CCCC_CLEANUP_RACE_DEBUG"], "a", encoding="ascii") as debug:
+        opened = os.fstat(directory_fd) if directory_fd is not None else None
+        current = os.lstat(run_dir)
+        debug.write("run=%s:%s current=%s:%s dirfd=%r victim=%r\\n" % (
+            directory.st_dev, directory.st_ino, current.st_dev, current.st_ino,
+            directory_fd, open(os.path.join(run_dir, "agent.stdout"), "rb").read(),
+        ))
+"""
+if needle not in source:
+    raise SystemExit(97)
+print(source.replace(needle, attack, 1))
+' "$source") || exit $?
+      shift 3
+      exec "$CCCC_REAL_PYTHON" -I -c "$source" "$@"
+      ;;
+  esac
+fi
+exec "$CCCC_REAL_PYTHON" "$@"
+CLEANUP_RACE_SHIM
+  chmod +x "$CASE_BIN/python3" || return 1
+  CCCC_REAL_PYTHON="$real_python" CCCC_CLEANUP_RACE_VICTIM="$victim" \
+    CCCC_CLEANUP_RACE_DEBUG="$CASE_DIR/cleanup-race-debug" run_delegate codex
+  assert_eq 125 "$CASE_RC" 'cleanup identity-race status' || return 1
+  current=$(find "$CASE_TMP" -maxdepth 1 -type d -name 'cccc.*' ! -name '*.owned' -print) || return 1
+  owned=$(find "$CASE_TMP" -maxdepth 1 -type d -name 'cccc.*.owned' -print) || return 1
+  [ -n "$current" ] && [ -n "$owned" ] || {
+    test_diag 'cleanup race did not leave both current victim and original owned directory'
+    return 1
+  }
+  assert_eq 'preexisting important data' \
+    "$(cat "$current/agent.stdout" 2>/dev/null || true)" \
+    'cleanup deleted a replacement-victim entry' || {
+      test_diag "cleanup race identities: $(cat "$CASE_DIR/cleanup-race-debug" 2>/dev/null || true)"
+      test_diag "remaining entries: $(find "$CASE_TMP" -maxdepth 2 -print 2>/dev/null | tr '\n' ' ')"
+      return 1
+    }
+  [ -s "$owned/agent.stdout" ] || {
+    test_diag 'original owned run directory contents were not preserved after pathname race'
+    return 1
+  }
+  case "$CASE_OUTPUT" in *'cccc: delegated report:'*) return 1 ;; esac
+}
+
+assert_child_artifact_symlink_is_safe() {
+  local artifact=$1 victim
+  prepare_case || return 1
+  require_symlink_capability "$CASE_DIR" || return 77
+  victim="$CASE_DIR/$artifact-victim"
+  printf 'do not overwrite\n' >"$victim"
+  CCCC_FAKE_SCENARIO=poison-run-artifact CCCC_FAKE_ARTIFACT_KIND=symlink \
+    CCCC_FAKE_ARTIFACT_NAME="$artifact" CCCC_FAKE_REFERENT="$victim" run_delegate codex
+  assert_eq 'do not overwrite' "$(cat "$victim")" "$artifact symlink referent" || return 1
+  assert_eq 125 "$CASE_RC" "$artifact tamper status" || return 1
+  case "$CASE_OUTPUT" in *'cccc: delegated report:'*) return 1 ;; esac
+}
+
+test_child_symlink_cannot_redirect_delegate_log() {
+  assert_child_artifact_symlink_is_safe delegate.log
+}
+
+test_child_symlink_cannot_redirect_post_status() {
+  assert_child_artifact_symlink_is_safe status.after
+}
+
+test_child_symlink_cannot_redirect_changed_paths() {
+  assert_child_artifact_symlink_is_safe changed.z
+}
+
+assert_child_artifact_fifo_is_bounded() {
+  local artifact=$1
+  prepare_case || return 1
+  require_fifo_capability "$CASE_DIR" || return 77
+  CCCC_FAKE_SCENARIO=poison-run-artifact CCCC_FAKE_ARTIFACT_KIND=fifo \
+    CCCC_FAKE_ARTIFACT_NAME="$artifact" run_delegate_with_outer_timeout codex
+  if [ "$CASE_RC" -eq 124 ]; then
+    test_diag "$artifact FIFO caused a post-child write to block"
+    return 1
+  fi
+  assert_eq 125 "$CASE_RC" "$artifact FIFO tamper status" || return 1
+  case "$CASE_OUTPUT" in *'cccc: delegated report:'*) return 1 ;; esac
+}
+
+test_child_fifo_cannot_block_delegate_log() {
+  assert_child_artifact_fifo_is_bounded delegate.log
+}
+
+test_child_fifo_cannot_block_post_status() {
+  assert_child_artifact_fifo_is_bounded status.after
+}
+
+test_child_fifo_cannot_block_changed_paths() {
+  assert_child_artifact_fifo_is_bounded changed.z
+}
+
+test_child_cannot_forge_authenticated_runner_outcome() {
+  prepare_case || return 1
+  CCCC_FAKE_SCENARIO=forge-runner-timeout run_delegate codex
+  assert_eq 125 "$CASE_RC" 'forged runner outcome status' || return 1
+  case "$CASE_OUTPUT" in
+    *'runner outcome: kind=wrapper-timeout'*)
+      test_diag 'child-forged status was trusted as a wrapper timeout'
+      return 1
+      ;;
+    *'cccc: delegated report:'*) return 1 ;;
+  esac
+}
+
+test_codex_report_path_cannot_redirect_cli_write() {
+  local victim
+  prepare_case || return 1
+  require_symlink_capability "$CASE_DIR" || return 77
+  victim="$CASE_DIR/codex-report-write-victim"
+  printf 'do not overwrite\n' >"$victim"
+  CCCC_FAKE_SCENARIO=report-write-symlink CCCC_FAKE_REFERENT="$victim" run_delegate codex
+  assert_eq 'do not overwrite' "$(cat "$victim")" 'Codex report-path referent' || return 1
+  [ "$CASE_RC" -ne 0 ] || return 1
+  case "$CASE_OUTPUT" in *'cccc: delegated report:'*) return 1 ;; esac
 }
 
 test_dirty_untracked_and_index_only_second_changes_are_detected() {
@@ -1461,6 +2059,153 @@ PARENT_RACE_SHIM
   assert_eq '' "$(git -C "$CASE_REPO" status --porcelain=v1)" 'publish parent race changed Git status'
 }
 
+test_publication_binds_manifest_source_identity_and_digest() {
+  local real_python kind attacked destination
+  require_posix_inode_capability || return 77
+  for kind in delegate.log report.md; do
+    prepare_case || return 1
+    real_python=$(command -v python3) || return 1
+    printf 'forged publication payload\n' >"$CASE_DIR/publication-source-victim"
+    cat >"$CASE_BIN/python3" <<'PUBLICATION_SOURCE_RACE_SHIM'
+#!/usr/bin/env bash
+is_publish=0
+last=
+second_last=
+for argument in "$@"; do
+  case "$argument" in */publish-no-clobber.py) is_publish=1 ;; esac
+  second_last=$last
+  last=$argument
+done
+if [ "$is_publish" -eq 1 ]; then
+  source=$second_last
+  case "$source:$CCCC_PUBLICATION_SOURCE_KIND" in
+    */delegate.log:delegate.log|*/report.md:report.md)
+      if [ ! -e "$CCCC_PUBLICATION_SOURCE_RACE_ONCE" ]; then
+        : >"$CCCC_PUBLICATION_SOURCE_RACE_ONCE"
+        printf '%s\n' "$source" >"$CCCC_PUBLICATION_SOURCE_RACE_PATH"
+        mv "$source" "$CCCC_PUBLICATION_SOURCE_ORIGINAL" || exit 97
+        mv "$CCCC_PUBLICATION_SOURCE_VICTIM" "$source" || exit 97
+      fi
+      ;;
+  esac
+fi
+exec "$CCCC_REAL_PYTHON" "$@"
+PUBLICATION_SOURCE_RACE_SHIM
+    chmod +x "$CASE_BIN/python3" || return 1
+    CCCC_REAL_PYTHON="$real_python" CCCC_PUBLICATION_SOURCE_KIND="$kind" \
+      CCCC_PUBLICATION_SOURCE_RACE_ONCE="$CASE_DIR/publication-source-raced" \
+      CCCC_PUBLICATION_SOURCE_RACE_PATH="$CASE_DIR/publication-source-race-path" \
+      CCCC_PUBLICATION_SOURCE_ORIGINAL="$CASE_DIR/original-$kind" \
+      CCCC_PUBLICATION_SOURCE_VICTIM="$CASE_DIR/publication-source-victim" \
+      run_delegate codex
+    case "$CASE_RC" in 5|125) ;; *)
+      test_diag "$kind publication source race returned $CASE_RC instead of 5 or 125"
+      return 1
+      ;;
+    esac
+    [ -e "$CASE_DIR/publication-source-raced" ] || {
+      test_diag "$kind publication source race injection did not fire"
+      return 1
+    }
+    attacked=$(cat "$CASE_DIR/publication-source-race-path") || return 1
+    assert_eq 'forged publication payload' \
+      "$(cat "$attacked" 2>/dev/null || true)" \
+      "$kind replacement victim was cleaned" || return 1
+    case "$kind" in
+      delegate.log) destination="$CASE_REPO/docs/tasks/T-test.log" ;;
+      report.md) destination="$CASE_REPO/docs/tasks/T-test-report.md" ;;
+    esac
+    [ ! -e "$destination" ] || {
+      test_diag "$kind forged replacement was published"
+      return 1
+    }
+  done
+}
+
+test_claude_publication_binds_same_inode_report_digest() {
+  local real_python report
+  prepare_case || return 1
+  real_python=$(command -v python3) || return 1
+  report="$CASE_REPO/docs/tasks/T-test-report.md"
+  cat >"$CASE_BIN/python3" <<'CLAUDE_REPORT_DIGEST_RACE_SHIM'
+#!/usr/bin/env bash
+is_publish=0
+last=
+second_last=
+for argument in "$@"; do
+  case "$argument" in */publish-no-clobber.py) is_publish=1 ;; esac
+  second_last=$last
+  last=$argument
+done
+if [ "$is_publish" -eq 1 ]; then
+  source=$second_last
+  case "$source" in
+    */agent.stdout)
+      if [ ! -e "$CCCC_CLAUDE_REPORT_DIGEST_RACE_ONCE" ]; then
+        : >"$CCCC_CLAUDE_REPORT_DIGEST_RACE_ONCE"
+        printf 'forged same-inode report\n' >"$source" || exit 97
+      fi
+      ;;
+  esac
+fi
+exec "$CCCC_REAL_PYTHON" "$@"
+CLAUDE_REPORT_DIGEST_RACE_SHIM
+  chmod +x "$CASE_BIN/python3" || return 1
+  CCCC_REAL_PYTHON="$real_python" \
+    CCCC_CLAUDE_REPORT_DIGEST_RACE_ONCE="$CASE_DIR/claude-report-digest-raced" \
+    run_delegate claude
+  [ -e "$CASE_DIR/claude-report-digest-raced" ] || {
+    test_diag 'Claude report same-inode race injection did not fire'
+    return 1
+  }
+  case "$CASE_RC" in 5|125) ;; *)
+    test_diag "Claude same-inode report race returned $CASE_RC instead of 5 or 125"
+    return 1
+    ;;
+  esac
+  [ ! -e "$report" ] || {
+    test_diag 'forged same-inode Claude report was published'
+    return 1
+  }
+}
+
+test_windows_identity_helpers_and_child_exit_range_are_explicit() {
+  python3 - "$DELEGATE" <<'PY'
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+names = [
+    "cccc_delegate_directory_identity",
+    "cccc_delegate_manifest_add",
+    "cccc_delegate_verify_post_child_namespace",
+    "cccc_delegate_remove_run_dir",
+    "cccc_delegate_release_lock",
+    "cccc_delegate_file_identity",
+    "cccc_delegate_capture_card_identity",
+    "cccc_delegate_parse_codex_json",
+    "cccc_delegate_parse_runner_status",
+    "cccc_delegate_write_log",
+]
+for index, name in enumerate(names):
+    marker = name + "() {"
+    start = text.find(marker)
+    if start < 0:
+        raise SystemExit("missing identity helper: " + name)
+    candidates = [text.find(other + "() {", start + len(marker)) for other in names]
+    candidates = [candidate for candidate in candidates if candidate >= 0]
+    end = min(candidates) if candidates else len(text)
+    section = text[start:end]
+    if "st_file_attributes" not in section or "st_reparse_tag" not in section:
+        raise SystemExit("identity helper lacks both Windows reparse indicators: " + name)
+
+runner_start = text.index("cccc_delegate_parse_runner_status() {")
+runner_end = text.index("cccc_delegate_write_log() {", runner_start)
+runner = text[runner_start:runner_end]
+if "4294967295" not in runner:
+    raise SystemExit("Windows child-exit UINT32 maximum is not explicit")
+PY
+}
+
 wait_for_ready_count() {
   local directory=$1 wanted=$2 attempts=0 count
   while [ "$attempts" -lt 500 ]; do
@@ -1678,6 +2423,82 @@ test_repo_lock_is_shared_by_linked_worktrees() {
   assert_eq 0 "$(cat "$CASE_DIR/first-rc")" 'linked-worktree lock owner status'
 }
 
+test_windows_linked_worktree_uses_absolute_git_common_dir() {
+  local linked real_git git_log
+  prepare_case || return 1
+  linked="$CASE_DIR/windows-linked-worktree"
+  git -C "$CASE_REPO" worktree add -q -b windows-linked-test "$linked" || return 1
+  real_git=$(command -v git)
+  git_log="$CASE_DIR/windows-git-argv.log"
+  cat >"$CASE_BIN/git" <<'WINDOWS_COMMON_GIT_SHIM'
+#!/usr/bin/env bash
+has_common=0
+has_absolute=0
+for argument in "$@"; do
+  printf '%s\n' "$argument" >>"$CCCC_WINDOWS_GIT_LOG"
+  case "$argument" in
+    --git-common-dir) has_common=1 ;;
+    --path-format=absolute) has_absolute=1 ;;
+  esac
+done
+printf '%s\n' '--' >>"$CCCC_WINDOWS_GIT_LOG"
+if [ "$has_common" -eq 1 ] && [ "$has_absolute" -eq 0 ]; then
+  printf '%s\n' 'C:/simulated/shared/common-dir'
+  exit 0
+fi
+exec "$CCCC_FAKE_REAL_GIT" "$@"
+WINDOWS_COMMON_GIT_SHIM
+  chmod +x "$CASE_BIN/git" || return 1
+  MSYSTEM=MINGW64 CCCC_FAKE_REAL_GIT="$real_git" CCCC_WINDOWS_GIT_LOG="$git_log" \
+    run_delegate codex "$CASE_CARD" "$linked"
+  assert_eq 0 "$CASE_RC" 'Windows linked-worktree common-dir status' || return 1
+  [ -s "$linked/docs/tasks/T-test-report.md" ] || return 1
+  [ -s "$linked/docs/tasks/T-test.log" ] || return 1
+  grep -Fxq -- '--path-format=absolute' "$git_log" || {
+    test_diag 'Git common-dir was not requested in absolute path format'
+    return 1
+  }
+}
+
+test_windows_native_status_mode_allows_normal_execution() {
+  require_windows_git_bash || return 77
+  prepare_case || return 1
+  run_delegate codex
+  assert_success_outputs
+}
+
+test_windows_uint_child_exit_maps_to_agent_failure() {
+  local real_python
+  require_windows_git_bash || return 77
+  prepare_case || return 1
+  real_python=$(command -v python3)
+  cat >"$CASE_BIN/python3" <<'WINDOWS_LARGE_STATUS_SHIM'
+#!/usr/bin/env bash
+status_file=
+token_file=
+previous=
+for argument in "$@"; do
+  if [ "$previous" = --status-file ]; then status_file=$argument; fi
+  if [ "$previous" = --status-token-file ]; then token_file=$argument; fi
+  previous=$argument
+done
+if [ -n "$status_file" ]; then
+  if [ -n "$token_file" ]; then
+    "$CCCC_REAL_PYTHON" -I "$CCCC_AUTH_STATUS_HELPER" \
+      "$token_file" "$status_file" child-exit 4294967295 || exit 125
+  else
+    printf '%s\n' \
+      'cccc-timeout-result-v1 kind=child-exit value=4294967295' >"$status_file"
+  fi
+  exit 70
+fi
+exec "$CCCC_REAL_PYTHON" "$@"
+WINDOWS_LARGE_STATUS_SHIM
+  chmod +x "$CASE_BIN/python3" || return 1
+  CCCC_REAL_PYTHON="$real_python" run_delegate codex
+  assert_eq 70 "$CASE_RC" 'Windows UINT child-exit mapping'
+}
+
 test_repo_lock_signal_window_cleans_before_retry() {
   local real_ln
   require_posix_inode_capability || return 77
@@ -1701,6 +2522,35 @@ LN_SIGNAL_SHIM
   : >"$CASE_LAUNCH"
   run_delegate claude
   assert_success_outputs
+}
+
+test_repo_lock_owner_registration_signal_window_leaves_no_owner_file() {
+  local real_chmod common leftovers
+  require_posix_inode_capability || return 77
+  prepare_case || return 1
+  real_chmod=$(command -v chmod)
+  common=$(git -C "$CASE_REPO" rev-parse --git-common-dir) || return 1
+  case "$common" in /*) ;; *) common="$CASE_REPO/$common" ;; esac
+  common=$(CDPATH= cd -P -- "$common" && pwd) || return 1
+  cat >"$CASE_BIN/chmod" <<'OWNER_CHMOD_SIGNAL_SHIM'
+#!/usr/bin/env bash
+last=
+for argument in "$@"; do last=$argument; done
+"$CCCC_REAL_CHMOD" "$@"
+rc=$?
+case "$last" in
+  */.cccc-delegate-owner.*)
+    if [ "$rc" -eq 0 ]; then kill -HUP "$PPID"; fi
+    ;;
+esac
+exit "$rc"
+OWNER_CHMOD_SIGNAL_SHIM
+  chmod +x "$CASE_BIN/chmod" || return 1
+  CCCC_REAL_CHMOD="$real_chmod" run_delegate claude
+  assert_eq 129 "$CASE_RC" 'owner-registration signal status' || return 1
+  assert_not_launched || return 1
+  leftovers=$(find "$common" -maxdepth 1 -name '.cccc-delegate-owner.*' -type f -print)
+  assert_eq '' "$leftovers" 'owner-registration signal left a stale ownership file'
 }
 
 test_old_owner_never_deletes_replacement_lock_inode() {
@@ -1824,6 +2674,16 @@ test_lock_release_failure_overrides_success_with_125() {
     cleanup_injected_lock_files "$common" || true; return 1;
   }
   case "$CASE_OUTPUT" in *'cccc: delegated report:'*) cleanup_injected_lock_files "$common" || true; return 1 ;; esac
+  [ -s "$CASE_REPO/docs/tasks/T-test-report.md" ] || {
+    test_diag 'post-publish cleanup failure did not preserve its diagnostic report'
+    cleanup_injected_lock_files "$common" || true
+    return 1
+  }
+  [ -s "$CASE_REPO/docs/tasks/T-test.log" ] || {
+    test_diag 'post-publish cleanup failure did not preserve its diagnostic log'
+    cleanup_injected_lock_files "$common" || true
+    return 1
+  }
   [ -e "$common/cccc-v2.lock" ] || return 1
   cleanup_injected_lock_files "$common"
 }
@@ -1973,10 +2833,24 @@ run_test 'trusted runner launch failure maps to 127' test_trusted_runner_launch_
 run_test 'policy failure precedes agent and timeout status' test_policy_failure_precedes_agent_and_timeout_status
 run_test 'cleanup failure precedes policy failure' test_cleanup_failure_precedes_policy_failure
 run_test 'unsafe or inconsistent runner status fails closed' test_unsafe_or_inconsistent_runner_status_fails_closed
+run_test 'runner status identity stays bound through manifest registration' test_runner_status_identity_is_bound_through_manifest_registration
+run_test 'signal runner status identity stays bound through manifest registration' test_signal_runner_status_identity_is_bound_through_manifest_registration
+run_test 'manifest rejects duplicate names and noncanonical flags' test_manifest_registration_rejects_duplicate_and_noncanonical_flags
 run_test 'signals preserve status clean child and release lock' test_signals_preserve_status_cleanup_child_and_release_lock
+run_test 'runner PID registration signal window is safe' test_runner_pid_registration_signal_window_is_safe
 run_test 'runner cleanup failure precedes wrapper signals' test_signal_runner_cleanup_failure_overrides_signal_with_125
 run_test 'natural child background descendant is cleaned' test_natural_child_background_descendant_is_cleaned
 run_test 'Codex unsafe report sources fail boundedly' test_codex_unsafe_report_sources_fail_boundedly
+run_test 'run-dir replacement never deletes victim data' test_run_dir_replacement_never_deletes_replacement_victim
+run_test 'run-dir cleanup rechecks identity at unlink' test_run_dir_cleanup_rechecks_identity_at_unlink
+run_test 'child symlink cannot redirect delegate log' test_child_symlink_cannot_redirect_delegate_log
+run_test 'child symlink cannot redirect post status' test_child_symlink_cannot_redirect_post_status
+run_test 'child symlink cannot redirect changed paths' test_child_symlink_cannot_redirect_changed_paths
+run_test 'child FIFO cannot block delegate log' test_child_fifo_cannot_block_delegate_log
+run_test 'child FIFO cannot block post status' test_child_fifo_cannot_block_post_status
+run_test 'child FIFO cannot block changed paths' test_child_fifo_cannot_block_changed_paths
+run_test 'child cannot forge authenticated runner outcome' test_child_cannot_forge_authenticated_runner_outcome
+run_test 'Codex report path cannot redirect CLI write' test_codex_report_path_cannot_redirect_cli_write
 run_test 'dirty untracked and index-only changes are detected' test_dirty_untracked_and_index_only_second_changes_are_detected
 run_test 'unchanged dirty policy-outside baseline is not attributed' test_unchanged_dirty_out_of_policy_baseline_is_not_attributed_to_child
 run_test 'newline out-of-policy path is escaped' test_newline_out_of_policy_path_is_escaped
@@ -1985,10 +2859,17 @@ run_test 'symlink and FIFO outputs are never clobbered' test_symlink_and_fifo_ou
 run_test 'post-preflight output injection cannot publish' test_post_preflight_output_injection_is_not_published
 run_test 'report publish failure leaves diagnostic orphan log' test_report_publish_failure_leaves_diagnostic_orphan_log
 run_test 'publish parent identity rejects last moment regular swap' test_publish_parent_identity_rejects_last_moment_regular_swap
+run_test 'publication binds manifest source identity and digest' test_publication_binds_manifest_source_identity_and_digest
+run_test 'Claude publication binds same-inode report digest' test_claude_publication_binds_same_inode_report_digest
+run_test 'Windows identity helpers and child exit range are explicit' test_windows_identity_helpers_and_child_exit_range_are_explicit
 run_test 'repo lock blocks same and different cards before baseline' test_repo_lock_blocks_same_and_different_cards
 run_test 'repo lock is acquired before Git status baseline' test_repo_lock_is_acquired_before_git_status_baseline
 run_test 'repo lock is shared by linked worktrees' test_repo_lock_is_shared_by_linked_worktrees
+run_test 'Windows linked worktree uses absolute Git common-dir' test_windows_linked_worktree_uses_absolute_git_common_dir
+run_test 'Windows native status mode allows normal execution' test_windows_native_status_mode_allows_normal_execution
+run_test 'Windows UINT child exit maps to agent failure' test_windows_uint_child_exit_maps_to_agent_failure
 run_test 'repo lock signal acquisition window is recoverable' test_repo_lock_signal_window_cleans_before_retry
+run_test 'repo lock owner registration signal window is clean' test_repo_lock_owner_registration_signal_window_leaves_no_owner_file
 run_test 'old lock owner cannot delete a replacement inode' test_old_owner_never_deletes_replacement_lock_inode
 run_test 'repo lock remains held through publication' test_repo_lock_remains_held_during_publication
 run_test 'lock release cleanup failure precedes success' test_lock_release_failure_overrides_success_with_125

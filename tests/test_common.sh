@@ -428,6 +428,53 @@ test_atomic_publish_rejects_replaced_parent_identity() {
   [ ! -e "$original/result.md" ]
 }
 
+test_atomic_publish_binds_expected_source_identity_and_digest() {
+  local tmp source original identity digest parent_identity
+  tmp=$(new_test_dir) || return 1
+  source="$tmp/source"
+  original="$tmp/original-source"
+  printf 'trusted\n' >"$source"
+  identity=$(python3 - "$source" <<'PY'
+import os
+import sys
+value = os.stat(sys.argv[1], follow_symlinks=False)
+print("%d:%d" % (value.st_dev, value.st_ino))
+PY
+  ) || return 1
+  digest=$(python3 - "$source" <<'PY'
+import hashlib
+import sys
+print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())
+PY
+  ) || return 1
+  cccc_capture_destination_parent_identity "$tmp/normal.md" || return 1
+  parent_identity=$CCCC_DESTINATION_PARENT_IDENTITY
+  cccc_atomic_publish "$source" "$tmp/normal.md" "$parent_identity" "$identity" "$digest" || return 1
+  assert_eq trusted "$(cat "$tmp/normal.md")" 'bound source publication' || return 1
+
+  mv "$source" "$original" || return 1
+  printf 'forged\n' >"$source"
+  cccc_capture_destination_parent_identity "$tmp/replaced.md" || return 1
+  parent_identity=$CCCC_DESTINATION_PARENT_IDENTITY
+  assert_fails cccc_atomic_publish \
+    "$source" "$tmp/replaced.md" "$parent_identity" "$identity" "$digest" || return 1
+  [ ! -e "$tmp/replaced.md" ] || return 1
+  assert_eq forged "$(cat "$source")" 'replacement source preserved' || return 1
+
+  identity=$(python3 - "$source" <<'PY'
+import os
+import sys
+value = os.stat(sys.argv[1], follow_symlinks=False)
+print("%d:%d" % (value.st_dev, value.st_ino))
+PY
+  ) || return 1
+  cccc_capture_destination_parent_identity "$tmp/mutated.md" || return 1
+  parent_identity=$CCCC_DESTINATION_PARENT_IDENTITY
+  assert_fails cccc_atomic_publish \
+    "$source" "$tmp/mutated.md" "$parent_identity" "$identity" "$digest" || return 1
+  [ ! -e "$tmp/mutated.md" ]
+}
+
 test_common_python_invocations_ignore_pythonpath() {
   local tmp attack marker repo before after changed identity
   tmp=$(new_test_dir) || return 1
@@ -964,6 +1011,7 @@ run_test "card rejects every intermediate symlink" test_card_rejects_every_inter
 run_test "private run directory is mode 700" test_run_dir_is_private
 run_test "existing outputs are refused and claims are atomic" test_output_refusal_and_claim
 run_test "atomic publish pins the captured parent identity" test_atomic_publish_rejects_replaced_parent_identity
+run_test "atomic publish binds expected source identity and digest" test_atomic_publish_binds_expected_source_identity_and_digest
 run_test "common Python invocations ignore PYTHONPATH" test_common_python_invocations_ignore_pythonpath
 run_test "claim loser never owns the winner claim" test_claim_loser_never_owns_winner_claim
 run_test "output symlink is refused" test_output_refuses_symlink
