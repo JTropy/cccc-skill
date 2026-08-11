@@ -624,7 +624,7 @@ PY
 }
 
 cccc_warn_ignored_audit_boundary() {
-  cccc_warn 'Git-ignored paths are outside the cccc Git-visible audit boundary'
+  cccc_warn 'Git metadata and Git-ignored paths are outside the cccc Git-visible audit boundary'
 }
 
 _cccc_validate_policy_path() {
@@ -634,6 +634,13 @@ _cccc_validate_policy_path() {
     ' '*|*' '|*$'\t'*|*'*'*|*'?'*|*'['*|*']'*) return 1 ;;
   esac
   return 0
+}
+
+_cccc_is_git_metadata_path() {
+  case "/${1-}/" in
+    */.[gG][iI][tT]/*) return 0 ;;
+  esac
+  return 1
 }
 
 _cccc_validate_allowed_path_physical() {
@@ -731,6 +738,10 @@ cccc_parse_allowed_paths() {
         cccc_die "invalid allowed path: $line"
         return 1
       fi
+      if _cccc_is_git_metadata_path "$line"; then
+        cccc_die "Git metadata cannot be an allowed path: $line"
+        return 1
+      fi
       if ! _cccc_validate_allowed_path_physical "$line"; then
         return 1
       fi
@@ -745,7 +756,7 @@ cccc_parse_allowed_paths() {
   fi
   CCCC_ALLOWED_PATHS=("${parsed_paths[@]}")
   CCCC_ALLOWED_PATHS_COUNT=$count
-  cccc_warn 'allowed paths are a post-run Git audit boundary, not OS-level write isolation'
+  cccc_warn 'allowed paths are a post-run Git audit boundary, not OS-level write isolation; Git metadata and Git-ignored paths are outside this audit boundary'
   return 0
 }
 

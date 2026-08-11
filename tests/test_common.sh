@@ -538,6 +538,52 @@ test_allowed_paths_reject_symlinks_and_invalid_existing_shapes() {
     test_diag "missing audit-only warning: $output"
     return 1
   }
+  printf '%s' "$output" | grep -qi 'metadata.*ignored.*outside' || {
+    test_diag "missing metadata/ignored boundary warning: $output"
+    return 1
+  }
+}
+
+test_allowed_paths_reject_git_metadata_in_normal_repo() {
+  local tmp repo card rule
+  tmp=$(new_test_dir) || return 1
+  repo="$tmp/repo"
+  init_test_repo "$repo" || return 1
+  mkdir -p "$repo/nested"
+  printf 'allowed\n' >"$repo/.gitignore"
+  cccc_resolve_repo "$repo" || return 1
+  card="$tmp/card.md"
+  for rule in '.git' '.git/' '.git/config' '.GIT/Config' 'nested/.GiT/config'; do
+    write_policy_card "$card" "$rule"
+    assert_fails cccc_parse_allowed_paths "$card" || {
+      test_diag "accepted Git metadata allowed path: $rule"
+      return 1
+    }
+  done
+  write_policy_card "$card" '.gitignore' '.github/'
+  cccc_parse_allowed_paths "$card" >/dev/null 2>&1 || return 1
+}
+
+test_allowed_paths_reject_git_metadata_in_linked_worktree() {
+  local tmp main linked card rule
+  tmp=$(new_test_dir) || return 1
+  main="$tmp/main"
+  linked="$tmp/linked"
+  init_test_repo "$main" || return 1
+  printf 'initial\n' >"$main/file"
+  git -C "$main" add file || return 1
+  git -C "$main" commit -qm initial || return 1
+  git -C "$main" worktree add -q -b cccc-linked-test "$linked" || return 1
+  [ -f "$linked/.git" ] && [ ! -L "$linked/.git" ] || return 1
+  cccc_resolve_repo "$linked" || return 1
+  card="$tmp/card.md"
+  for rule in '.git' '.git/' '.git/config' '.GIT/Config'; do
+    write_policy_card "$card" "$rule"
+    assert_fails cccc_parse_allowed_paths "$card" || {
+      test_diag "linked worktree accepted Git metadata path: $rule"
+      return 1
+    }
+  done
 }
 
 test_return_globals_are_cleared_before_failure() {
@@ -608,7 +654,7 @@ PY
   cccc_git_snapshot "$repo" "$ignored" || return 1
   cccc_snapshot_equal "$after" "$ignored" || return 1
   cccc_git_has_ignored_paths "$repo" || return 1
-  cccc_warn_ignored_audit_boundary 2>&1 | grep -qi 'ignored.*outside' || return 1
+  cccc_warn_ignored_audit_boundary 2>&1 | grep -qi 'metadata.*ignored.*outside' || return 1
   cccc_git_status_z "$repo" "$status" || return 1
   python3 - "$status" <<'PY' || return 1
 import sys
@@ -822,6 +868,8 @@ run_test "output FIFO is refused" test_output_refuses_fifo
 run_test "allowed paths parse and match exact boundaries" test_allowed_paths_parse_and_match_exactly
 run_test "ambiguous allowed-path policy is rejected" test_allowed_paths_reject_ambiguous_policy
 run_test "allowed paths reject symlinks and invalid existing shapes" test_allowed_paths_reject_symlinks_and_invalid_existing_shapes
+run_test "allowed paths reject Git metadata in a normal repo" test_allowed_paths_reject_git_metadata_in_normal_repo
+run_test "allowed paths reject Git metadata in a linked worktree" test_allowed_paths_reject_git_metadata_in_linked_worktree
 run_test "return globals clear stale values before failures" test_return_globals_are_cleared_before_failure
 run_test "snapshot fingerprints Git-visible content only" test_snapshot_fingerprints_visible_content_and_ignores_ignored
 run_test "snapshot is NUL-safe for newline paths" test_snapshot_handles_newline_path
