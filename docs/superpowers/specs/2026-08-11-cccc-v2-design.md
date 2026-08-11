@@ -106,7 +106,7 @@ repo lock 使用同文件系统的唯一 ownership inode 与 no-clobber hard lin
 
 模型沿用各 CLI 当前配置；`CCCC_MODEL` 与 `CCCC_EFFORT` 允许调用者显式覆盖。脚本不再声称能判断“更强模型”，也不强制升级用户模型或预算。
 
-子代理最终回复直接作为结构化 report 捕获。wrapper 确认本轮新产物、重新验证 card/card-parent identity 与输出空缺后，通过硬链接执行 no-clobber 原子发布；POSIX 发布固定到已验证 parent dirfd，Windows 至少拒绝 reparse parent 并在每个提交点前后复核 identity。日志先发布，report/opinion 最后作为唯一成功标记。目标或 repo lock 已存在、或平台不支持安全发布时失败，不退化成覆盖式 `mv`。若日志已发布而 report 提交失败，保留孤儿日志作为失败诊断并明确提示人工删除后重试；绝不把它当作成功。wrapper 发现 HEAD 改变、card/祖先变化、缺少 report、策略外文件变化或 agent 非零退出时必须返回非零，不得把旧文件当成功回执。同一仓库的 cccc 执行被序列化。
+子代理最终回复直接作为结构化 report 捕获。wrapper 确认本轮新产物、重新验证 card/card-parent identity 与输出空缺后，通过硬链接执行 no-clobber 原子发布；POSIX 发布固定到已验证 parent dirfd，Windows 至少拒绝 reparse parent 并在每个提交点前后复核 identity。日志先发布，report/opinion 最后发布，但调用成功的权威信号始终是 wrapper 最终退出码 `0`；消费者不得仅凭 report/opinion 存在推断成功，因为发布后的 lock 或临时目录清理仍可能失败并把最终状态提升为 `125`。目标或 repo lock 已存在、或平台不支持安全发布时失败，不退化成覆盖式 `mv`。若日志已发布而 report 提交失败，保留孤儿日志作为失败诊断并明确提示人工删除后重试；若 report 已发布后清理失败，同样保留现场、返回 `125` 且不打印成功提示。wrapper 发现 HEAD 改变、card/祖先变化、缺少 report、策略外文件变化或 agent 非零退出时必须返回非零，不得把旧文件当成功回执。同一仓库的 cccc 执行被序列化。
 
 失败优先级固定为：timeout/interruption cleanup failure `125` > HEAD/card/snapshot/path-policy violation `4` > 可信 runner timeout `124` > child nonzero `70`；`5` 仅用于 agent 启动前的输出/lock 冲突、空或不安全产物及发布阶段失败。所有组合仍在 stderr 记录原始 child outcome。
 
