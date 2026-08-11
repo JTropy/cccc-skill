@@ -1782,7 +1782,7 @@ test_target_outputs_do_not_conflict_and_second_run_obeys_dirty_gate() {
   CCCC_FAKE_OPINION='claude first' run_consult claude
   assert_success_outputs claude || return 1
   opinion=$(opinion_path claude "$CASE_CARD"); content=$(cat "$opinion")
-  identity=$(stat -f '%d:%i' "$opinion" 2>/dev/null || stat -c '%d:%i' "$opinion") || return 1
+  identity=$(stat -c '%d:%i' "$opinion" 2>/dev/null || stat -f '%d:%i' "$opinion") || return 1
   : >"$CASE_LAUNCH"
   CCCC_FAKE_OPINION='codex second' run_consult codex
   assert_eq 4 "$CASE_RC" 'second target dirty-default status' || return 1
@@ -1790,7 +1790,7 @@ test_target_outputs_do_not_conflict_and_second_run_obeys_dirty_gate() {
   CCCC_ALLOW_DIRTY=1 CCCC_FAKE_OPINION='codex second' run_consult codex
   assert_success_outputs codex || return 1
   assert_eq "$content" "$(cat "$opinion")" 'first opinion content changed' || return 1
-  assert_eq "$identity" "$(stat -f '%d:%i' "$opinion" 2>/dev/null || stat -c '%d:%i' "$opinion")" 'first opinion inode changed'
+  assert_eq "$identity" "$(stat -c '%d:%i' "$opinion" 2>/dev/null || stat -f '%d:%i' "$opinion")" 'first opinion inode changed'
 }
 
 install_publication_attack_python() {

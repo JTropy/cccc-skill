@@ -9,6 +9,10 @@ trap 'test_signal_cleanup 2' INT
 trap 'test_signal_cleanup 15' TERM
 
 COMMON="$TEST_DIR/../skills/cccc/scripts/cccc-common.sh"
+COMMON_TEST_WINDOWS=0
+case ${MSYSTEM-} in
+  MINGW*|MSYS*) COMMON_TEST_WINDOWS=1 ;;
+esac
 COMMON_LOADED=0
 if [ -r "$COMMON" ]; then
   # shellcheck source=/dev/null
@@ -55,10 +59,22 @@ test_target_is_exact() {
   old_path=$PATH
   PATH="$tmp:$PATH"
   cccc_resolve_target_argv claude || return 1
-  assert_eq 1 "${#CCCC_TARGET_ARGV[@]}" "claude argv length" || return 1
-  assert_eq "$tmp/claude" "${CCCC_TARGET_ARGV[0]}" "resolved claude" || return 1
+  if [ "$COMMON_TEST_WINDOWS" -eq 1 ]; then
+    assert_eq 2 "${#CCCC_TARGET_ARGV[@]}" "claude argv length" || return 1
+    assert_eq bash "${CCCC_TARGET_ARGV[0]}" "resolved Claude interpreter" || return 1
+    assert_eq "$tmp/claude" "${CCCC_TARGET_ARGV[1]}" "resolved claude" || return 1
+  else
+    assert_eq 1 "${#CCCC_TARGET_ARGV[@]}" "claude argv length" || return 1
+    assert_eq "$tmp/claude" "${CCCC_TARGET_ARGV[0]}" "resolved claude" || return 1
+  fi
   cccc_resolve_target_argv codex || return 1
-  assert_eq "$tmp/codex" "${CCCC_TARGET_ARGV[0]}" "resolved codex" || return 1
+  if [ "$COMMON_TEST_WINDOWS" -eq 1 ]; then
+    assert_eq 2 "${#CCCC_TARGET_ARGV[@]}" "codex argv length" || return 1
+    assert_eq bash "${CCCC_TARGET_ARGV[0]}" "resolved Codex interpreter" || return 1
+    assert_eq "$tmp/codex" "${CCCC_TARGET_ARGV[1]}" "resolved codex" || return 1
+  else
+    assert_eq "$tmp/codex" "${CCCC_TARGET_ARGV[0]}" "resolved codex" || return 1
+  fi
   assert_fails cccc_resolve_target_argv Claude || return 1
   assert_fails cccc_resolve_target_argv codex-nightly || return 1
   assert_fails cccc_resolve_target_argv "$tmp/claude" || return 1
@@ -277,6 +293,7 @@ test_repo_resolution_follows_physical_worktree_path() {
   if ! ln -s "$repo" "$link" 2>/dev/null; then
     return 77
   fi
+  [ -L "$link" ] || return 77
   cccc_resolve_repo "$link/a/b" || return 1
   physical=$(CDPATH= cd -P -- "$repo" && pwd)
   assert_eq "$physical" "$CCCC_REPO_ROOT" "physical repo root"
@@ -318,6 +335,7 @@ test_card_rejects_symlink() {
   if ! ln -s '子 目录/卡 片.md' "$repo/docs/tasks/link.md" 2>/dev/null; then
     return 77
   fi
+  [ -L "$repo/docs/tasks/link.md" ] || return 77
   cccc_resolve_repo "$repo" || return 1
   assert_fails cccc_validate_card docs/tasks/link.md docs/tasks
 }
@@ -343,6 +361,7 @@ test_card_rejects_physical_root_escape() {
   if ! ln -s "$tmp/outside" "$repo/docs/tasks/escape" 2>/dev/null; then
     return 77
   fi
+  [ -L "$repo/docs/tasks/escape" ] || return 77
   cccc_resolve_repo "$repo" || return 1
   assert_fails cccc_validate_card docs/tasks/escape/card.md docs/tasks
 }
@@ -357,6 +376,7 @@ test_card_rejects_every_intermediate_symlink() {
   if ! ln -s real "$repo/docs/tasks/alias" 2>/dev/null; then
     return 77
   fi
+  [ -L "$repo/docs/tasks/alias" ] || return 77
   cccc_resolve_repo "$repo" || return 1
   assert_fails cccc_validate_card docs/tasks/alias/nested/card.md docs/tasks || return 1
 
@@ -364,7 +384,10 @@ test_card_rejects_every_intermediate_symlink() {
   init_test_repo "$root_link_repo" || return 1
   mkdir -p "$root_link_repo/docs/real-tasks"
   printf '# card\n' >"$root_link_repo/docs/real-tasks/card.md"
-  ln -s real-tasks "$root_link_repo/docs/tasks" || return 1
+  if ! ln -s real-tasks "$root_link_repo/docs/tasks" 2>/dev/null ||
+     [ ! -L "$root_link_repo/docs/tasks" ]; then
+    return 77
+  fi
   cccc_resolve_repo "$root_link_repo" || return 1
   assert_fails cccc_validate_card docs/tasks/card.md docs/tasks
 }
@@ -380,6 +403,7 @@ test_run_dir_is_private() {
     *) test_diag "run dir outside requested temp root: $CCCC_RUN_DIR"; return 1 ;;
   esac
   mode=$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$CCCC_RUN_DIR") || return 1
+  [ "$COMMON_TEST_WINDOWS" -eq 0 ] || return 77
   assert_eq 700 "$mode" "run directory mode"
 }
 
@@ -395,7 +419,9 @@ test_output_refusal_and_claim() {
   cccc_acquire_claim "$claim" || return 1
   assert_fails cccc_acquire_claim "$claim" || return 1
   mode=$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$claim") || return 1
-  assert_eq 700 "$mode" "claim mode" || return 1
+  if [ "$COMMON_TEST_WINDOWS" -eq 0 ]; then
+    assert_eq 700 "$mode" "claim mode" || return 1
+  fi
   printf 'publish me\n' >"$tmp/source"
   cccc_capture_destination_parent_identity "$tmp/published.md" || return 1
   identity=$CCCC_DESTINATION_PARENT_IDENTITY
@@ -422,6 +448,7 @@ test_atomic_publish_rejects_replaced_parent_identity() {
   if ! ln -s "$outside" "$parent" 2>/dev/null; then
     return 77
   fi
+  [ -L "$parent" ] || return 77
   assert_fails cccc_atomic_publish "$tmp/source" "$parent/result.md" "$identity" || return 1
   [ ! -e "$outside/result.md" ] || return 1
   assert_eq keep "$(cat "$outside/referent.md")" "outside referent" || return 1
@@ -557,9 +584,13 @@ test_output_refuses_symlink() {
   if ! ln -s referent "$tmp/output.md" 2>/dev/null; then
     return 77
   fi
+  [ -L "$tmp/output.md" ] || return 77
   assert_fails cccc_refuse_output_target "$tmp/output.md" || return 1
   assert_eq keep "$(cat "$tmp/referent")" "symlink referent" || return 1
-  ln -s missing "$tmp/dangling.md" || return 1
+  if ! ln -s missing "$tmp/dangling.md" 2>/dev/null ||
+     [ ! -L "$tmp/dangling.md" ]; then
+    return 77
+  fi
   assert_fails cccc_refuse_output_target "$tmp/dangling.md"
 }
 
@@ -643,8 +674,15 @@ test_allowed_paths_reject_symlinks_and_invalid_existing_shapes() {
   if ! ln -s allowed-dir "$repo/link-inside" 2>/dev/null; then
     return 77
   fi
-  ln -s "$tmp/outside" "$repo/link-outside" || return 1
-  ln -s missing-target "$repo/dangling" || return 1
+  [ -L "$repo/link-inside" ] || return 77
+  if ! ln -s "$tmp/outside" "$repo/link-outside" 2>/dev/null ||
+     [ ! -L "$repo/link-outside" ]; then
+    return 77
+  fi
+  if ! ln -s missing-target "$repo/dangling" 2>/dev/null ||
+     [ ! -L "$repo/dangling" ]; then
+    return 77
+  fi
   cccc_resolve_repo "$repo" || return 1
   card="$tmp/card.md"
   for rule in 'link-inside/' 'link-outside/' 'dangling/' 'allowed-dir' 'existing-file/' 'existing-file/child'; do
@@ -932,12 +970,15 @@ test_snapshot_detects_symlink_target() {
   if ! ln -s target-one "$repo/link" 2>/dev/null; then
     return 77
   fi
+  [ -L "$repo/link" ] || return 77
   git -C "$repo" add link || return 1
   before="$tmp/before.snapshot"
   after="$tmp/after.snapshot"
   cccc_git_snapshot "$repo" "$before" || return 1
   rm "$repo/link"
-  ln -s target-two "$repo/link" || return 1
+  if ! ln -s target-two "$repo/link" 2>/dev/null || [ ! -L "$repo/link" ]; then
+    return 77
+  fi
   cccc_git_snapshot "$repo" "$after" || return 1
   assert_fails cccc_snapshot_equal "$before" "$after"
 }

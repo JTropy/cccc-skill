@@ -138,7 +138,7 @@ find_run_dir() {
 
 if [ -n "${CCCC_FAKE_RUN_MODE_FILE-}" ]; then
   directory=$(find_run_dir) || exit 97
-  mode=$(stat -f '%Lp' "$directory" 2>/dev/null || stat -c '%a' "$directory" 2>/dev/null || true)
+  mode=$(stat -c '%a' "$directory" 2>/dev/null || stat -f '%Lp' "$directory" 2>/dev/null || true)
   printf '%s\n' "$mode" >"$CCCC_FAKE_RUN_MODE_FILE"
 fi
 

@@ -233,7 +233,7 @@ if [ -n "${CCCC_FAKE_PRIVATE_FILE-}" ]; then
   {
     if [ -n "$mcp_config" ]; then
       printf 'mcp_path=%s\n' "$mcp_config"
-      mode=$(stat -f '%Lp' "$mcp_config" 2>/dev/null || stat -c '%a' "$mcp_config" 2>/dev/null || true)
+      mode=$(stat -c '%a' "$mcp_config" 2>/dev/null || stat -f '%Lp' "$mcp_config" 2>/dev/null || true)
       printf 'mcp_mode=%s\n' "$mode"
       printf 'mcp_type=%s\n' "$(if [ -f "$mcp_config" ] && [ ! -L "$mcp_config" ]; then printf regular; else printf unsafe; fi)"
       printf 'mcp_content_begin\n'
@@ -242,7 +242,7 @@ if [ -n "${CCCC_FAKE_PRIVATE_FILE-}" ]; then
     fi
     if [ -n "$codex_cwd" ]; then
       printf 'codex_cwd=%s\n' "$codex_cwd"
-      mode=$(stat -f '%Lp' "$codex_cwd" 2>/dev/null || stat -c '%a' "$codex_cwd" 2>/dev/null || true)
+      mode=$(stat -c '%a' "$codex_cwd" 2>/dev/null || stat -f '%Lp' "$codex_cwd" 2>/dev/null || true)
       printf 'codex_cwd_mode=%s\n' "$mode"
       printf 'codex_cwd_entries_begin\n'
       find "$codex_cwd" -mindepth 1 -maxdepth 1 -print 2>/dev/null || true
