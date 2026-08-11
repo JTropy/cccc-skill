@@ -564,6 +564,32 @@ test_allowed_paths_reject_git_metadata_in_normal_repo() {
   cccc_parse_allowed_paths "$card" >/dev/null 2>&1 || return 1
 }
 
+test_allowed_paths_reject_ntfs_git_aliases_and_colons() {
+  local tmp repo card rule
+  tmp=$(new_test_dir) || return 1
+  repo="$tmp/repo"
+  init_test_repo "$repo" || return 1
+  cccc_resolve_repo "$repo" || return 1
+  card="$tmp/card.md"
+  for rule in \
+    '.git./config' \
+    '.git . . ./hooks/pre-commit' \
+    'git~1/config' \
+    'GIT~1. /config' \
+    '.git::$INDEX_ALLOCATION/config' \
+    'nested/.GiT... /config' \
+    'nested/deeper/GiT~1... /hooks/pre-commit' \
+    'src/file:stream'; do
+    write_policy_card "$card" "$rule"
+    assert_fails cccc_parse_allowed_paths "$card" || {
+      test_diag "accepted NTFS Git metadata alias or colon: $rule"
+      return 1
+    }
+  done
+  write_policy_card "$card" '.gitignore' '.github/' 'legit~1/'
+  cccc_parse_allowed_paths "$card" >/dev/null 2>&1 || return 1
+}
+
 test_allowed_paths_reject_git_metadata_in_linked_worktree() {
   local tmp main linked card rule
   tmp=$(new_test_dir) || return 1
@@ -869,6 +895,7 @@ run_test "allowed paths parse and match exact boundaries" test_allowed_paths_par
 run_test "ambiguous allowed-path policy is rejected" test_allowed_paths_reject_ambiguous_policy
 run_test "allowed paths reject symlinks and invalid existing shapes" test_allowed_paths_reject_symlinks_and_invalid_existing_shapes
 run_test "allowed paths reject Git metadata in a normal repo" test_allowed_paths_reject_git_metadata_in_normal_repo
+run_test "allowed paths reject NTFS Git aliases and colons" test_allowed_paths_reject_ntfs_git_aliases_and_colons
 run_test "allowed paths reject Git metadata in a linked worktree" test_allowed_paths_reject_git_metadata_in_linked_worktree
 run_test "return globals clear stale values before failures" test_return_globals_are_cleared_before_failure
 run_test "snapshot fingerprints Git-visible content only" test_snapshot_fingerprints_visible_content_and_ignores_ignored

@@ -631,15 +631,36 @@ _cccc_validate_policy_path() {
   local path=${1-}
   _cccc_relative_path_is_safe "$path" || return 1
   case "$path" in
-    ' '*|*' '|*$'\t'*|*'*'*|*'?'*|*'['*|*']'*) return 1 ;;
+    ' '*|*' '|*$'\t'*|*:*|*'*'*|*'?'*|*'['*|*']'*) return 1 ;;
   esac
   return 0
 }
 
 _cccc_is_git_metadata_path() {
-  case "/${1-}/" in
-    */.[gG][iI][tT]/*) return 0 ;;
-  esac
+  local path=${1-} component remainder
+  remainder=$path
+  while :; do
+    case "$remainder" in
+      */*)
+        component=${remainder%%/*}
+        remainder=${remainder#*/}
+        ;;
+      *)
+        component=$remainder
+        remainder=
+        ;;
+    esac
+    while :; do
+      case "$component" in
+        *' '|*.) component=${component%?} ;;
+        *) break ;;
+      esac
+    done
+    case "$component" in
+      .[gG][iI][tT]|[gG][iI][tT]'~1') return 0 ;;
+    esac
+    [ -n "$remainder" ] || break
+  done
   return 1
 }
 
