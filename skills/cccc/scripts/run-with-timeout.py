@@ -4,11 +4,13 @@
 import os
 import hashlib
 import hmac
+import ntpath
 import signal
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -27,6 +29,36 @@ STATUS_VERSION_V1 = "cccc-timeout-result-v1"
 STATUS_VERSION_V2 = "cccc-timeout-result-v2"
 STATUS_TOKEN_BYTES = 32
 WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+WINDOWS_SHELL_RESULT_VERSION = "cccc-windows-shell-result-v1"
+WINDOWS_SHELL_BOOTSTRAP_CLEANUP_FAILURE = 0x4CCC007D
+WINDOWS_SHELL_BOOTSTRAP_LAUNCH_FAILURE = 0x4CCC007F
+
+
+class WindowsShellArgvTransport:
+    """Environment argv payload plus an identity-bound result directory."""
+
+    def __init__(self, result_dir, identity, arguments, helper_path):
+        self.result_dir = result_dir
+        self.result_path = os.path.join(result_dir, "result")
+        self.dir_dev = identity.st_dev
+        self.dir_ino = identity.st_ino
+        self.count = len(arguments)
+        self.helper_path = helper_path
+        self.prefix = f"CCCC_WINDOWS_ARGV_{uuid.uuid4().hex}"
+        canonical = b"".join(
+            os.fsencode(argument) + b"\0" for argument in arguments
+        )
+        self.digest = hashlib.sha256(canonical).hexdigest()
+        self.environment = os.environ.copy()
+        self.environment[f"{self.prefix}_COUNT"] = str(self.count)
+        self.environment[f"{self.prefix}_DIGEST"] = self.digest
+        for index, argument in enumerate(arguments):
+            self.environment[f"{self.prefix}_{index}"] = argument
+
+    def cleanup(self):
+        return cleanup_windows_shell_result_dir(
+            self.result_dir, self.dir_dev, self.dir_ino
+        )
 
 
 class RunnerInterrupted(Exception):
@@ -591,44 +623,169 @@ def resolve_windows_command(command):
     return [resolved, *command[1:]], None
 
 
+def is_windows_posix_shell(path):
+    return ntpath.basename(path).lower() == "bash.exe"
+
+
+def windows_path_for_msys(path):
+    return path.replace("\\", "/")
+
+
+def cleanup_windows_shell_result_dir(path, expected_dev, expected_ino):
+    try:
+        identity = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"could not inspect Windows shell result directory: {exc}"
+    if (
+        not stat.S_ISDIR(identity.st_mode)
+        or stat.S_ISLNK(identity.st_mode)
+        or (
+            getattr(identity, "st_file_attributes", 0)
+            & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+        )
+        or identity.st_dev != expected_dev
+        or identity.st_ino != expected_ino
+    ):
+        return "Windows shell result directory identity changed; retained for inspection"
+    try:
+        os.rmdir(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"could not remove Windows shell result directory: {exc}"
+    return None
+
+
+def create_windows_shell_argv_transport(command):
+    helper_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "windows-exec-argv.sh"
+    )
+    try:
+        helper_identity = os.lstat(helper_path)
+    except OSError as exc:
+        return None, f"could not inspect Windows argv bootstrap helper: {exc}", 127
+    if (
+        not stat.S_ISREG(helper_identity.st_mode)
+        or stat.S_ISLNK(helper_identity.st_mode)
+        or (
+            getattr(helper_identity, "st_file_attributes", 0)
+            & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+        )
+    ):
+        return None, "unsafe Windows argv bootstrap helper", 127
+
+    result_dir = None
+    transport = None
+    try:
+        result_dir = tempfile.mkdtemp(prefix="cccc-shell-result-")
+        identity = os.lstat(result_dir)
+        if (
+            not stat.S_ISDIR(identity.st_mode)
+            or stat.S_ISLNK(identity.st_mode)
+            or (
+                getattr(identity, "st_file_attributes", 0)
+                & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+            )
+        ):
+            raise OSError("created Windows shell result directory is unsafe")
+        transport = WindowsShellArgvTransport(
+            result_dir, identity, command, helper_path
+        )
+        return transport, None, None
+    except (OSError, UnicodeError, ValueError) as exc:
+        errors = [f"could not create Windows shell argv transport: {exc}"]
+        cleanup_error = transport.cleanup() if transport is not None else None
+        if transport is None and result_dir is not None:
+            try:
+                os.rmdir(result_dir)
+            except OSError as cleanup_exc:
+                cleanup_error = (
+                    f"could not remove partial Windows shell result directory: "
+                    f"{cleanup_exc}"
+                )
+        if cleanup_error:
+            errors.append(cleanup_error)
+        return None, join_cleanup_errors(*errors), (125 if cleanup_error else 127)
+
+
 def launch_windows_bootstrap(command):
     """Start a gated bootstrap, assign it to a Job, then release its target command."""
+    transport = None
     if os.name == "nt":
         command, resolution_error = resolve_windows_command(command)
         if resolution_error:
             return None, None, None, resolution_error, 127
+        if is_windows_posix_shell(command[0]):
+            transport, transport_error, transport_status = (
+                create_windows_shell_argv_transport(command[1:])
+            )
+            if transport_error:
+                return None, None, None, transport_error, transport_status
     try:
         gate = WindowsGate()
     except OSError as exc:
-        return None, None, None, f"could not create Windows bootstrap gate: {exc}", 127
-    bootstrap_command = [
-        sys.executable,
-        os.path.abspath(__file__),
-        "--windows-bootstrap",
-        gate.name,
-        str(os.getpid()),
-        "--",
-        *command,
-    ]
+        cleanup_error = transport.cleanup() if transport is not None else None
+        return None, None, None, join_cleanup_errors(
+            f"could not create Windows bootstrap gate: {exc}", cleanup_error
+        ), (125 if cleanup_error else 127)
+    if transport is None:
+        bootstrap_command = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--windows-bootstrap",
+            gate.name,
+            str(os.getpid()),
+            "--",
+            *command,
+        ]
+    else:
+        bootstrap_command = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--windows-bootstrap",
+            gate.name,
+            str(os.getpid()),
+            "--shell-env-argv",
+            command[0],
+            transport.helper_path,
+            transport.prefix,
+            str(transport.count),
+            transport.digest,
+            transport.result_path,
+            str(transport.dir_dev),
+            str(transport.dir_ino),
+        ]
     try:
         process = subprocess.Popen(
             bootstrap_command,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            **({"env": transport.environment} if transport is not None else {}),
         )
     except OSError as exc:
         close_error = gate.close()
+        transport_error = transport.cleanup() if transport is not None else None
         return None, gate, None, join_cleanup_errors(
-            f"could not start Windows bootstrap: {exc}", close_error
-        ), (125 if close_error else 127)
+            f"could not start Windows bootstrap: {exc}", close_error, transport_error
+        ), (125 if close_error or transport_error else 127)
+    if transport is not None:
+        process._cccc_windows_argv_transport = transport
     job, setup_error, cleanup_error = create_windows_job(process)
     if setup_error:
-        cleanup_error = join_cleanup_errors(cleanup_error, gate.close())
+        transport_error = transport.cleanup() if transport is not None else None
+        cleanup_error = join_cleanup_errors(
+            cleanup_error, gate.close(), transport_error
+        )
         return process, gate, None, join_cleanup_errors(setup_error, cleanup_error), (
             125 if cleanup_error else 127
         )
     release_error = gate.set()
     if release_error:
-        cleanup_error = join_cleanup_errors(stop_windows(process, job), gate.close())
+        transport_error = transport.cleanup() if transport is not None else None
+        cleanup_error = join_cleanup_errors(
+            stop_windows(process, job), gate.close(), transport_error
+        )
         return process, gate, None, join_cleanup_errors(release_error, cleanup_error), (
             125 if cleanup_error else 127
         )
@@ -698,6 +855,172 @@ def run_windows_bootstrap(event_name, parent_pid, command):
     except OSError as exc:
         print(f"cccc-timeout: bootstrap cannot start command: {exc}", file=sys.stderr)
         return 127
+
+
+def validate_windows_shell_environment(prefix, count, expected_digest):
+    if not prefix.startswith("CCCC_WINDOWS_ARGV_"):
+        return None, "invalid Windows shell argv prefix"
+    if os.environ.get(f"{prefix}_COUNT") != str(count):
+        return None, "Windows shell argv count metadata changed"
+    if os.environ.get(f"{prefix}_DIGEST") != expected_digest:
+        return None, "Windows shell argv digest metadata changed"
+    arguments = []
+    for index in range(count):
+        key = f"{prefix}_{index}"
+        if key not in os.environ:
+            return None, f"Windows shell argv item {index} is missing"
+        arguments.append(os.environ[key])
+    canonical = b"".join(
+        os.fsencode(argument) + b"\0" for argument in arguments
+    )
+    actual_digest = hashlib.sha256(canonical).hexdigest()
+    if not hmac.compare_digest(actual_digest, expected_digest):
+        return None, "Windows shell argv digest verification failed"
+    return arguments, None
+
+
+def consume_windows_shell_result(path, result_dir, dir_dev, dir_ino):
+    flags = os.O_RDONLY
+    for optional_flag in ("O_NOFOLLOW", "O_CLOEXEC", "O_BINARY"):
+        flags |= getattr(os, optional_flag, 0)
+    fd = None
+    identity = None
+    data = b""
+    error = None
+    try:
+        fd = os.open(path, flags)
+        os.set_inheritable(fd, False)
+        identity = os.fstat(fd)
+        if (
+            not stat.S_ISREG(identity.st_mode)
+            or (
+                getattr(identity, "st_file_attributes", 0)
+                & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+            )
+        ):
+            raise OSError("Windows shell result is not a safe regular file")
+        while len(data) <= 128:
+            chunk = os.read(fd, 129 - len(data))
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > 128:
+            raise OSError("Windows shell result is too large")
+    except OSError as exc:
+        error = f"could not consume Windows shell result: {exc}"
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError as exc:
+                error = join_cleanup_errors(
+                    error, f"could not close Windows shell result: {exc}"
+                )
+
+    if identity is not None:
+        try:
+            current = os.lstat(path)
+            if (
+                current.st_dev != identity.st_dev
+                or current.st_ino != identity.st_ino
+                or not stat.S_ISREG(current.st_mode)
+                or stat.S_ISLNK(current.st_mode)
+                or (
+                    getattr(current, "st_file_attributes", 0)
+                    & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+                )
+            ):
+                error = join_cleanup_errors(
+                    error,
+                    "Windows shell result identity changed; retained for inspection",
+                )
+            else:
+                os.unlink(path)
+        except FileNotFoundError:
+            error = join_cleanup_errors(error, "Windows shell result disappeared")
+        except OSError as exc:
+            error = join_cleanup_errors(
+                error, f"could not remove Windows shell result: {exc}"
+            )
+
+    cleanup_error = cleanup_windows_shell_result_dir(result_dir, dir_dev, dir_ino)
+    error = join_cleanup_errors(error, cleanup_error)
+    if error:
+        return None, error
+    prefix = f"{WINDOWS_SHELL_RESULT_VERSION} ".encode("ascii")
+    if not data.startswith(prefix) or not data.endswith(b"\n"):
+        return None, "invalid Windows shell result record"
+    value = data[len(prefix):-1]
+    if not value.isdigit():
+        return None, "invalid Windows shell result status"
+    status = int(value)
+    if not 0 <= status <= 255:
+        return None, "invalid Windows shell target status"
+    return status, None
+
+
+def run_windows_shell_bootstrap(
+    event_name,
+    parent_pid,
+    shell,
+    helper_path,
+    prefix,
+    count,
+    digest,
+    result_path,
+    dir_dev,
+    dir_ino,
+):
+    wait_result = wait_for_windows_bootstrap_gate(event_name, parent_pid)
+    if wait_result == "parent":
+        cleanup_error = cleanup_windows_shell_result_dir(
+            os.path.dirname(result_path), dir_dev, dir_ino
+        )
+        if cleanup_error:
+            print(f"cccc-timeout: bootstrap cleanup failed: {cleanup_error}", file=sys.stderr)
+            return WINDOWS_SHELL_BOOTSTRAP_CLEANUP_FAILURE
+        return 0
+    if wait_result != "gate":
+        print(f"cccc-timeout: bootstrap {wait_result}", file=sys.stderr)
+        return WINDOWS_SHELL_BOOTSTRAP_LAUNCH_FAILURE
+    _arguments, environment_error = validate_windows_shell_environment(
+        prefix, count, digest
+    )
+    if environment_error:
+        print(f"cccc-timeout: bootstrap cleanup failed: {environment_error}", file=sys.stderr)
+        return WINDOWS_SHELL_BOOTSTRAP_CLEANUP_FAILURE
+    try:
+        helper_status = subprocess.Popen(
+            [
+                shell,
+                windows_path_for_msys(helper_path),
+                prefix,
+                str(count),
+                digest,
+                windows_path_for_msys(result_path),
+            ],
+        ).wait()
+    except OSError as exc:
+        print(f"cccc-timeout: bootstrap cannot start shell: {exc}", file=sys.stderr)
+        return WINDOWS_SHELL_BOOTSTRAP_LAUNCH_FAILURE
+    if helper_status != 0:
+        cleanup_error = cleanup_windows_shell_result_dir(
+            os.path.dirname(result_path), dir_dev, dir_ino
+        )
+        print(
+            f"cccc-timeout: bootstrap cleanup failed: shell helper exited {helper_status}",
+            file=sys.stderr,
+        )
+        if cleanup_error:
+            print(f"cccc-timeout: bootstrap cleanup failed: {cleanup_error}", file=sys.stderr)
+        return WINDOWS_SHELL_BOOTSTRAP_CLEANUP_FAILURE
+    target_status, result_error = consume_windows_shell_result(
+        result_path, os.path.dirname(result_path), dir_dev, dir_ino
+    )
+    if result_error:
+        print(f"cccc-timeout: bootstrap cleanup failed: {result_error}", file=sys.stderr)
+        return WINDOWS_SHELL_BOOTSTRAP_CLEANUP_FAILURE
+    return target_status
 
 
 def run(argv):
@@ -779,7 +1102,28 @@ def run(argv):
                         result_kind = "child-exit"
                         result_value = result
                 else:
-                    if not isinstance(result, int) or not 0 <= result <= 0xFFFFFFFF:
+                    shell_transport = getattr(process, "__dict__", {}).get(
+                        "_cccc_windows_argv_transport"
+                    )
+                    if (
+                        shell_transport is not None
+                        and result == WINDOWS_SHELL_BOOTSTRAP_CLEANUP_FAILURE
+                    ):
+                        result = cleanup_failed("Windows shell bootstrap failed")
+                        result_kind = "cleanup-failure"
+                        result_value = None
+                    elif (
+                        shell_transport is not None
+                        and result == WINDOWS_SHELL_BOOTSTRAP_LAUNCH_FAILURE
+                    ):
+                        print(
+                            "cccc-timeout: Windows shell bootstrap could not launch",
+                            file=sys.stderr,
+                        )
+                        result = 127
+                        result_kind = "launch-failure"
+                        result_value = None
+                    elif not isinstance(result, int) or not 0 <= result <= 0xFFFFFFFF:
                         print(
                             "cccc-timeout: invalid Windows child exit status",
                             file=sys.stderr,
@@ -886,18 +1230,54 @@ def run(argv):
                 result = cleanup_failed(close_error)
                 result_kind = "cleanup-failure"
                 result_value = None
+        if process is not None:
+            transport = getattr(process, "__dict__", {}).get(
+                "_cccc_windows_argv_transport"
+            )
+            if transport is not None:
+                cleanup_error = transport.cleanup()
+                if cleanup_error:
+                    result = cleanup_failed(cleanup_error)
+                    result_kind = "cleanup-failure"
+                    result_value = None
     return finish_with_status(status_file, result, result_kind, result_value)
 
 
 def main():
     if len(sys.argv) >= 5 and sys.argv[1] == "--windows-bootstrap":
-        if os.name != "nt" or sys.argv[4] != "--" or len(sys.argv) < 6:
+        if os.name != "nt":
             print("cccc-timeout: invalid Windows bootstrap invocation", file=sys.stderr)
             return 127
         try:
             parent_pid = int(sys.argv[3])
         except ValueError:
             print("cccc-timeout: invalid Windows bootstrap parent pid", file=sys.stderr)
+            return 127
+        if sys.argv[4] == "--shell-env-argv" and len(sys.argv) == 13:
+            try:
+                count = int(sys.argv[8])
+                dir_dev = int(sys.argv[11])
+                dir_ino = int(sys.argv[12])
+            except ValueError:
+                print("cccc-timeout: invalid Windows argv bootstrap metadata", file=sys.stderr)
+                return 127
+            if count < 0 or dir_dev < 0 or dir_ino < 0:
+                print("cccc-timeout: invalid Windows argv bootstrap metadata", file=sys.stderr)
+                return 127
+            return run_windows_shell_bootstrap(
+                sys.argv[2],
+                parent_pid,
+                sys.argv[5],
+                sys.argv[6],
+                sys.argv[7],
+                count,
+                sys.argv[9],
+                sys.argv[10],
+                dir_dev,
+                dir_ino,
+            )
+        if sys.argv[4] != "--" or len(sys.argv) < 6:
+            print("cccc-timeout: invalid Windows bootstrap invocation", file=sys.stderr)
             return 127
         # This process is the bootstrap child.  Its native exit status is the
         # target's DWORD and must reach the outer runner without normalization.

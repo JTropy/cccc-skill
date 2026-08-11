@@ -895,6 +895,328 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertIsNone(status)
 
+    def test_windows_msys_shell_uses_private_argv_transport(self):
+        process = mock.Mock()
+        gate = mock.Mock()
+        gate.name = "Local\\cccc-test-gate"
+        gate.set.return_value = None
+        job = mock.Mock()
+        shell = r"C:\\Program Files\\Git\\usr\\bin\\bash.exe"
+        original_arguments = [
+            r"C:\\repo\\skills\\cccc\\scripts\\delegate.sh",
+            "model_provider=\"openai\"",
+            "argument with spaces",
+            "$(must stay literal)",
+            "尾部\\",
+            "",
+        ]
+        transport = mock.Mock()
+        transport.prefix = "CCCC_WINDOWS_ARGV_deadbeef"
+        transport.count = len(original_arguments)
+        transport.digest = "a" * 64
+        transport.result_path = r"C:\\Temp\\cccc-result"
+        transport.result_dir = r"C:\\Temp\\cccc-transport"
+        transport.dir_dev = 123
+        transport.dir_ino = 456
+        transport.environment = {"SAFE": "1"}
+        transport.helper_path = r"C:\\repo\\skills\\cccc\\scripts\\windows-exec-argv.sh"
+
+        def launch(arguments, **_options):
+            self.assertEqual(
+                arguments,
+                [
+                    sys.executable,
+                    str(RUNNER.resolve()),
+                    "--windows-bootstrap",
+                    gate.name,
+                    str(os.getpid()),
+                    "--shell-env-argv",
+                    shell,
+                    transport.helper_path,
+                    transport.prefix,
+                    str(transport.count),
+                    transport.digest,
+                    transport.result_path,
+                    str(transport.dir_dev),
+                    str(transport.dir_ino),
+                ],
+            )
+            self.assertEqual(_options["env"], transport.environment)
+            for hostile in original_arguments:
+                self.assertNotIn(hostile, arguments)
+            return process
+
+        with mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
+             mock.patch.object(
+                 RUNNER_MODULE,
+                 "resolve_windows_command",
+                 return_value=([shell, *original_arguments], None),
+             ), \
+             mock.patch.object(
+                 RUNNER_MODULE,
+                 "create_windows_shell_argv_transport",
+                 return_value=(transport, None, None),
+             ), \
+             mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
+             mock.patch.object(
+                 RUNNER_MODULE.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
+             ), \
+             mock.patch.object(RUNNER_MODULE.subprocess, "Popen", side_effect=launch), \
+             mock.patch.object(RUNNER_MODULE, "create_windows_job", return_value=(job, None, None)):
+            bootstrap, created_gate, assigned_job, error, status = (
+                RUNNER_MODULE.launch_windows_bootstrap(["bash", *original_arguments])
+            )
+
+        self.assertIs(bootstrap, process)
+        self.assertIs(created_gate, gate)
+        self.assertIs(assigned_job, job)
+        self.assertIs(getattr(process, "_cccc_windows_argv_transport"), transport)
+        self.assertIsNone(error)
+        self.assertIsNone(status)
+
+    def test_windows_shell_argv_transport_uses_environment_not_sensitive_files(self):
+        command_arguments = [
+            r"C:\\repo\\skills\\cccc\\scripts\\delegate.sh",
+            "model_provider=\"openai\"",
+            "argument with spaces",
+            "",
+        ]
+        real_mkdtemp = tempfile.mkdtemp
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            RUNNER_MODULE.tempfile,
+            "mkdtemp",
+            side_effect=lambda **kwargs: real_mkdtemp(dir=directory, **kwargs),
+        ):
+            transport, error, status = (
+                RUNNER_MODULE.create_windows_shell_argv_transport(command_arguments)
+            )
+            self.assertIsNone(error)
+            self.assertIsNone(status)
+            self.assertFalse(any(Path(directory).glob("cccc-argv-*.bin")))
+            self.assertFalse(Path(transport.result_path).exists())
+            self.assertEqual(transport.count, len(command_arguments))
+            for index, argument in enumerate(command_arguments):
+                self.assertEqual(
+                    transport.environment[f"{transport.prefix}_{index}"], argument
+                )
+            self.assertEqual(
+                transport.environment[f"{transport.prefix}_COUNT"],
+                str(len(command_arguments)),
+            )
+            self.assertEqual(
+                transport.environment[f"{transport.prefix}_DIGEST"], transport.digest
+            )
+            self.assertIsNone(transport.cleanup())
+            self.assertFalse(Path(transport.result_dir).exists())
+
+    def test_windows_shell_transport_creation_failure_leaves_no_argv_artifact(self):
+        real_mkdtemp = tempfile.mkdtemp
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(
+                 RUNNER_MODULE.tempfile,
+                 "mkdtemp",
+                 side_effect=lambda **kwargs: real_mkdtemp(dir=directory, **kwargs),
+             ), \
+             mock.patch.object(
+                 RUNNER_MODULE,
+                 "WindowsShellArgvTransport",
+                 side_effect=OSError("injected construction failure"),
+             ):
+            transport, error, status = (
+                RUNNER_MODULE.create_windows_shell_argv_transport(["target", "secret"])
+            )
+
+            self.assertIsNone(transport)
+            self.assertEqual(status, 127)
+            self.assertIn("injected construction failure", error)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_windows_shell_internal_failure_is_authenticated_as_cleanup(self):
+        process = mock.Mock()
+        process.wait.return_value = RUNNER_MODULE.WINDOWS_SHELL_BOOTSTRAP_CLEANUP_FAILURE
+        process._cccc_windows_argv_transport = mock.Mock()
+        process._cccc_windows_argv_transport.cleanup.return_value = None
+        gate = mock.Mock()
+        gate.close.return_value = None
+        job = mock.Mock()
+        job.close.return_value = None
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            status_file = Path(directory) / "status"
+            with mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
+                 mock.patch.object(
+                     RUNNER_MODULE,
+                     "launch_windows_bootstrap",
+                     return_value=(process, gate, job, None, None),
+                 ), \
+                 mock.patch.object(RUNNER_MODULE.sys, "stderr", stderr):
+                status = RUNNER_MODULE.run(
+                    ["--status-file", str(status_file), "1", "--", "target"]
+                )
+
+            self.assertEqual(status, 125)
+            self.assertEqual(
+                status_file.read_text(encoding="ascii"),
+                "cccc-timeout-result-v1 kind=cleanup-failure value=none\n",
+            )
+            self.assertIn("Windows shell bootstrap failed", stderr.getvalue())
+
+    def test_native_windows_reserved_dword_remains_a_child_exit(self):
+        process = mock.Mock()
+        process.wait.return_value = RUNNER_MODULE.WINDOWS_SHELL_BOOTSTRAP_CLEANUP_FAILURE
+        gate = mock.Mock()
+        gate.close.return_value = None
+        job = mock.Mock()
+        job.close.return_value = None
+        with tempfile.TemporaryDirectory() as directory:
+            status_file = Path(directory) / "status"
+            with mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
+                 mock.patch.object(
+                     RUNNER_MODULE,
+                     "launch_windows_bootstrap",
+                     return_value=(process, gate, job, None, None),
+                 ):
+                status = RUNNER_MODULE.run(
+                    ["--status-file", str(status_file), "1", "--", "native.exe"]
+                )
+
+            self.assertEqual(
+                status, RUNNER_MODULE.WINDOWS_SHELL_BOOTSTRAP_CLEANUP_FAILURE
+            )
+            self.assertEqual(
+                status_file.read_text(encoding="ascii"),
+                "cccc-timeout-result-v1 kind=child-exit "
+                f"value={RUNNER_MODULE.WINDOWS_SHELL_BOOTSTRAP_CLEANUP_FAILURE}\n",
+            )
+
+    def test_windows_shell_natural_125_remains_a_child_exit(self):
+        process = mock.Mock()
+        process.wait.return_value = 125
+        gate = mock.Mock()
+        gate.close.return_value = None
+        job = mock.Mock()
+        job.close.return_value = None
+        with tempfile.TemporaryDirectory() as directory:
+            status_file = Path(directory) / "status"
+            with mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
+                 mock.patch.object(
+                     RUNNER_MODULE,
+                     "launch_windows_bootstrap",
+                     return_value=(process, gate, job, None, None),
+                 ):
+                status = RUNNER_MODULE.run(
+                    ["--status-file", str(status_file), "1", "--", "target"]
+                )
+
+            self.assertEqual(status, 125)
+            self.assertEqual(
+                status_file.read_text(encoding="ascii"),
+                "cccc-timeout-result-v1 kind=child-exit value=125\n",
+            )
+
+    def test_windows_shell_bootstrap_main_validates_and_forwards_metadata(self):
+        argv = [
+            "run-with-timeout.py",
+            "--windows-bootstrap",
+            "gate",
+            "123",
+            "--shell-env-argv",
+            r"C:\\Git\\bash.exe",
+            r"C:\\repo\\windows-exec-argv.sh",
+            "CCCC_WINDOWS_ARGV_deadbeef",
+            "4",
+            "a" * 64,
+            r"C:\\Temp\\result",
+            "5",
+            "6",
+        ]
+        with mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
+             mock.patch.object(RUNNER_MODULE.sys, "argv", argv), \
+             mock.patch.object(
+                 RUNNER_MODULE, "run_windows_shell_bootstrap", return_value=37
+             ) as run_bootstrap:
+            self.assertEqual(RUNNER_MODULE.main(), 37)
+
+        run_bootstrap.assert_called_once_with(
+            "gate",
+            123,
+            r"C:\\Git\\bash.exe",
+            r"C:\\repo\\windows-exec-argv.sh",
+            "CCCC_WINDOWS_ARGV_deadbeef",
+            4,
+            "a" * 64,
+            r"C:\\Temp\\result",
+            5,
+            6,
+        )
+
+    @unittest.skipUnless(shutil.which("bash"), "requires Bash")
+    def test_windows_shell_argv_helper_round_trips_hostile_arguments(self):
+        helper = (
+            ROOT
+            / "skills"
+            / "cccc"
+            / "scripts"
+            / "windows-exec-argv.sh"
+        )
+        arguments = [
+            "capture-argv.sh",
+            "model_provider=\"openai\"",
+            "argument with spaces",
+            "$(must stay literal)",
+            "尾部\\",
+            "",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            capture = directory / "capture.bin"
+            result_path = directory / "result"
+            capture_script = directory / arguments[0]
+            capture_script.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -u\n"
+                ": >\"$CCCC_ARGV_CAPTURE\"\n"
+                "for cccc_arg in \"$@\"; do\n"
+                "  printf '%s\\0' \"$cccc_arg\" >>\"$CCCC_ARGV_CAPTURE\"\n"
+                "done\n",
+                encoding="utf-8",
+            )
+            arguments[0] = str(capture_script)
+            environment = os.environ.copy()
+            environment["CCCC_ARGV_CAPTURE"] = str(capture)
+            prefix = "CCCC_WINDOWS_ARGV_deadbeef"
+            for index, argument in enumerate(arguments):
+                environment[f"{prefix}_{index}"] = argument
+            environment[f"{prefix}_COUNT"] = str(len(arguments))
+            canonical = b"".join(
+                os.fsencode(argument) + b"\0" for argument in arguments
+            )
+            digest = hashlib.sha256(canonical).hexdigest()
+            environment[f"{prefix}_DIGEST"] = digest
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(helper),
+                    prefix,
+                    str(len(arguments)),
+                    digest,
+                    str(result_path),
+                ],
+                capture_output=True,
+                env=environment,
+                timeout=10,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            self.assertEqual(
+                capture.read_bytes(),
+                b"".join(os.fsencode(argument) + b"\0" for argument in arguments[1:]),
+            )
+            self.assertEqual(
+                result_path.read_text(encoding="ascii"),
+                "cccc-windows-shell-result-v1 0\n",
+            )
+
     def test_windows_assignment_failure_never_releases_gate(self):
         process = mock.Mock()
         gate = mock.Mock()
@@ -1426,6 +1748,61 @@ class PosixProcessGroupTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "requires Windows process handling")
 class WindowsTimeoutTests(unittest.TestCase):
+    def test_reserved_bootstrap_statuses_survive_native_python_exit(self):
+        for status in (
+            RUNNER_MODULE.WINDOWS_SHELL_BOOTSTRAP_CLEANUP_FAILURE,
+            RUNNER_MODULE.WINDOWS_SHELL_BOOTSTRAP_LAUNCH_FAILURE,
+        ):
+            with self.subTest(status=status):
+                result = subprocess.run(
+                    [sys.executable, "-c", f"import sys; sys.exit({status})"],
+                    capture_output=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode, status)
+
+    def test_msys_bash_round_trips_complex_argument_boundaries(self):
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash, "Git Bash must be available")
+        arguments = [
+            "model_provider=\"openai\"",
+            "project_doc_max_bytes=0",
+            "argument with spaces",
+            "$(must stay literal)",
+            "尾部\\",
+            "",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            script = directory / "capture-argv.sh"
+            capture = directory / "capture.bin"
+            script.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -u\n"
+                ": >\"$CCCC_ARGV_CAPTURE\"\n"
+                "for cccc_arg in \"$@\"; do\n"
+                "  printf '%s\\0' \"$cccc_arg\" >>\"$CCCC_ARGV_CAPTURE\"\n"
+                "done\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            environment = os.environ.copy()
+            environment["CCCC_ARGV_CAPTURE"] = str(capture)
+            result = subprocess.run(
+                command("10", "--", bash, str(script), *arguments),
+                capture_output=True,
+                env=environment,
+                timeout=20,
+            )
+
+            self.assertEqual(
+                result.returncode, 0, result.stderr.decode(errors="replace")
+            )
+            self.assertEqual(
+                capture.read_bytes(),
+                b"".join(os.fsencode(argument) + b"\0" for argument in arguments),
+            )
+
     def test_timeout_terminates_direct_child(self):
         result = subprocess.run(
             command("1", "--", *child("import time; time.sleep(30)")),
