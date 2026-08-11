@@ -8,6 +8,10 @@ DELEGATE="$ROOT_DIR/skills/cccc/scripts/delegate.sh"
 FAKE_AGENT="$TEST_DIR/fixtures/fake-consult-agent.sh"
 AUTH_STATUS_HELPER="$TEST_DIR/fixtures/write-auth-runner-status.py"
 ORIGINAL_PATH=$PATH
+CONSULT_TEST_WINDOWS=0
+case ${MSYSTEM-}:$(uname -s 2>/dev/null || true) in
+  MINGW*:MINGW*|MSYS*:MSYS*|UCRT*:MINGW*) CONSULT_TEST_WINDOWS=1 ;;
+esac
 CODEX_STRICT_FEATURES='hooks
 plugins
 apps
@@ -257,18 +261,25 @@ if arguments and arguments[-1] == b"":
     arguments.pop()
 repo = sys.argv[2]
 physical_repo = os.path.realpath(repo)
+
+def path_key(value):
+    return os.path.normcase(os.path.realpath(os.path.abspath(value))).replace("\\", "/")
+
+repo_keys = {path_key(repo), path_key(physical_repo)}
 for argument in arguments:
     text = os.fsdecode(argument)
-    if text in (repo, physical_repo):
+    normalized_text = text.replace("\\", "/")
+    is_absolute_path = os.path.isabs(text)
+    if is_absolute_path and path_key(text) in repo_keys:
         text = "<REPO>"
-    elif any(
-        text.startswith(root + os.sep + "docs" + os.sep + "discussions")
+    elif is_absolute_path and any(
+        path_key(text).startswith(path_key(os.path.join(root, "docs", "discussions")) + "/")
         for root in (repo, physical_repo)
     ):
         text = "<CARD>"
-    elif text.endswith("/empty-mcp.json") or text.endswith("/mcp.json"):
+    elif normalized_text.endswith("/empty-mcp.json") or normalized_text.endswith("/mcp.json"):
         text = "<PRIVATE_MCP>"
-    elif "/cccc." in text and os.path.basename(text) in ("codex-cwd", "cwd"):
+    elif "/cccc." in normalized_text and os.path.basename(normalized_text) in ("codex-cwd", "cwd"):
         text = "<PRIVATE_CWD>"
     elif text.startswith("You are") or "expert consult" in text.lower() or "专家顾问" in text:
         text = "<PROMPT>"
@@ -651,7 +662,9 @@ test_claude_mcp_config_is_private_regular_0600_and_empty() {
   prepare_case || return 1
   run_consult claude
   assert_success_outputs || return 1
-  grep -Fxq 'mcp_mode=600' "$CASE_PRIVATE" || return 1
+  if [ "$CONSULT_TEST_WINDOWS" -eq 0 ]; then
+    grep -Fxq 'mcp_mode=600' "$CASE_PRIVATE" || return 1
+  fi
   grep -Fxq 'mcp_type=regular' "$CASE_PRIVATE" || return 1
   mcp_path=$(sed -n 's/^mcp_path=//p' "$CASE_PRIVATE")
   [ -n "$mcp_path" ] || return 1
@@ -796,7 +809,9 @@ test_codex_strict_private_cwd_is_0700_and_not_repo() {
   prepare_case || return 1
   run_consult codex
   assert_success_outputs codex || return 1
-  grep -Fxq 'codex_cwd_mode=700' "$CASE_PRIVATE" || return 1
+  if [ "$CONSULT_TEST_WINDOWS" -eq 0 ]; then
+    grep -Fxq 'codex_cwd_mode=700' "$CASE_PRIVATE" || return 1
+  fi
   cwd=$(sed -n 's/^codex_cwd=//p' "$CASE_PRIVATE")
   [ -n "$cwd" ] && [ "$cwd" != "$CASE_REPO_PHYSICAL" ] || return 1
   case "$cwd" in
@@ -906,12 +921,7 @@ test_child_environment_is_scoped_and_python_is_isolated() {
   python_log="$CASE_DIR/python-argv.log"
   cat >"$CASE_BIN/python3" <<'PYTHON_SHIM'
 #!/usr/bin/env bash
-"$CCCC_REAL_PYTHON" -I -c '
-import json
-import sys
-with open(sys.argv[1], "a", encoding="utf-8") as stream:
-    stream.write(json.dumps(sys.argv[2:]) + "\n")
-' "$CCCC_FAKE_PYTHON_LOG" "$@" || exit 98
+printf '%s\n' "${1-}" >>"$CCCC_FAKE_PYTHON_LOG" || exit 98
 exec "$CCCC_REAL_PYTHON" "$@"
 PYTHON_SHIM
   chmod +x "$CASE_BIN/python3" || return 1
@@ -923,14 +933,11 @@ PYTHON_SHIM
   grep -Fxq 'ENV=<unset>' "$CASE_ENV" || return 1
   grep -Fxq 'DISABLE_AUTOUPDATER=1' "$CASE_ENV" || return 1
   grep -Fxq 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1' "$CASE_ENV" || return 1
-  python3 -I - "$python_log" <<'PY'
-import json
-import sys
-for line in open(sys.argv[1], encoding="utf-8"):
-    args = json.loads(line)
-    if not args or args[0] != "-I":
-        raise SystemExit("non-isolated Python call: %r" % (args,))
-PY
+  [ -s "$python_log" ] || return 1
+  if grep -Fvxq -- '-I' "$python_log"; then
+    test_diag 'wrapper made a non-isolated Python call'
+    return 1
+  fi
 }
 
 test_clean_run_logs_git_metadata_and_audit_boundary() {
@@ -1186,6 +1193,9 @@ test_runner_status_hmac_namespace_and_rc_mismatches_fail_closed() {
   local mode real_python marker
   real_python=$(command -v python3) || return 1
   for mode in missing malformed symlink fifo wrong-mode wrong-mac inconsistent; do
+    if [ "$CONSULT_TEST_WINDOWS" -eq 1 ] && [ "$mode" = wrong-mode ]; then
+      continue
+    fi
     prepare_case || return 1
     install_runner_status_shim "$real_python" "$mode" || return 1
     marker="$CASE_DIR/status-attack-marker"
@@ -1413,6 +1423,7 @@ EARLY_RELEASE_SHIM
 
 test_signals_cleanup_descendants_outputs_lock_and_allow_retry() {
   local signal expected barrier pid child_pid attempts rc common lock launcher_python
+  require_posix_inode_capability || return 77
   require_consult || return 1
   for signal in HUP INT TERM; do
     case "$signal" in HUP) expected=129 ;; INT) expected=130 ;; TERM) expected=143 ;; esac
@@ -1654,7 +1665,9 @@ test_repo_lock_blocks_same_and_different_consult_cards_and_targets() {
   for card in root-help exec-help features; do
     assert_lock_precedes_codex_preflight_stage "$card" || return 1
   done
-  assert_lock_acquisition_signal_window || return 1
+  if require_posix_inode_capability; then
+    assert_lock_acquisition_signal_window || return 1
+  fi
   assert_lock_held_during_publication
 }
 
@@ -2231,7 +2244,9 @@ GIT_SHIM
   chmod +x "$CASE_BIN/git" || return 1
   CCCC_FAKE_GIT_LOG="$git_log" CCCC_FAKE_REAL_GIT="$real_git" run_consult codex
   assert_success_outputs codex || return 1
-  grep -Fxq 'codex_cwd_mode=700' "$CASE_PRIVATE" || return 1
+  if [ "$CONSULT_TEST_WINDOWS" -eq 0 ]; then
+    grep -Fxq 'codex_cwd_mode=700' "$CASE_PRIVATE" || return 1
+  fi
   for forbidden in commit stash reset checkout clean push; do
     if python3 -I - "$git_log" "$forbidden" <<'PY'
 import sys
