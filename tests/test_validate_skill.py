@@ -66,6 +66,17 @@ class ValidateSkillTests(unittest.TestCase):
             )
             self.assertIn("unsupported frontmatter field", "\n".join(self.validate(skill_path)))
 
+    def test_rejects_quoted_unsupported_private_frontmatter(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_path = self.make_skill(
+                Path(temp_dir),
+                frontmatter=(
+                    "---\nname: cccc\ndescription: Valid description\n"
+                    '"disable-model-invocation": true\n---\n'
+                ),
+            )
+            self.assertIn("unsupported frontmatter field", "\n".join(self.validate(skill_path)))
+
     def test_rejects_missing_frontmatter(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skill_path = self.make_skill(Path(temp_dir), frontmatter="# cccc\n")

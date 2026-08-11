@@ -18,7 +18,10 @@ ALLOWED_FRONTMATTER_FIELDS = {
     "allowed-tools",
 }
 KEBAB_CASE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*$")
-TOP_LEVEL_KEY = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*):(?:[ \t]*(.*))?$")
+TOP_LEVEL_KEY = re.compile(
+    r"^(?P<key>[A-Za-z][A-Za-z0-9_-]*|\"(?:[^\"\\\\]|\\\\.)*\"|'(?:[^']|'')*')"
+    r":(?:[ \t]*(?P<value>.*))?$"
+)
 MARKDOWN_LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 
 
@@ -48,8 +51,10 @@ def _frontmatter(text: str) -> tuple[dict[str, str], list[str]]:
             continue
         match = TOP_LEVEL_KEY.match(line)
         if match is None:
+            errors.append(f"invalid top-level frontmatter entry: {line}")
             continue
-        key, value = match.groups()
+        key = _parse_scalar(match.group("key"))
+        value = match.group("value")
         if key not in ALLOWED_FRONTMATTER_FIELDS:
             errors.append(f"unsupported frontmatter field: {key}")
         else:
@@ -120,7 +125,8 @@ def _interface_fields(openai_yaml: str) -> tuple[bool, dict[str, str]]:
             continue
         match = TOP_LEVEL_KEY.match(line.lstrip(" "))
         if match is not None:
-            key, value = match.groups()
+            key = _parse_scalar(match.group("key"))
+            value = match.group("value")
             fields[key] = _parse_scalar(value or "")
     return True, fields
 
