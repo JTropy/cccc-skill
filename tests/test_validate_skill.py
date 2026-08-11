@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import re
 from pathlib import Path
 
 try:
@@ -11,6 +12,7 @@ except ImportError:
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+CANONICAL_SKILL = REPOSITORY_ROOT / "skills" / "cccc"
 VALID_OPENAI_YAML = '''\
 interface:
   display_name: "cccc Peer Collaboration"
@@ -23,6 +25,11 @@ class ValidateSkillTests(unittest.TestCase):
     def validate(self, skill_path: Path) -> list[str]:
         self.assertIsNotNone(validate_skill, "the skill validator must be implemented")
         return validate_skill(skill_path)
+
+    def canonical_text(self, relative: str = "SKILL.md") -> str:
+        path = CANONICAL_SKILL / relative
+        self.assertTrue(path.is_file(), f"missing canonical file: {relative}")
+        return path.read_text(encoding="utf-8")
 
     def make_skill(
         self,
@@ -45,7 +52,151 @@ class ValidateSkillTests(unittest.TestCase):
         return skill_path
 
     def test_repository_skill_is_valid(self) -> None:
-        self.assertEqual([], self.validate(REPOSITORY_ROOT / "skills" / "cccc"))
+        self.assertEqual([], self.validate(CANONICAL_SKILL))
+
+    def test_repository_skill_is_a_concise_progressive_router(self) -> None:
+        text = self.canonical_text()
+        self.assertLessEqual(len(text.splitlines()), 500)
+        description = re.search(r"^description:\s*(.+)$", text, re.MULTILINE)
+        self.assertIsNotNone(description)
+        self.assertLessEqual(len(description.group(1)), 1024)
+        self.assertTrue(description.group(1).startswith("Use when"))
+        for reference in ("delegate.md", "consult.md", "setup.md", "troubleshooting.md"):
+            self.assertIn(f"references/{reference}", text)
+            self.assertTrue((CANONICAL_SKILL / "references" / reference).is_file())
+
+    def test_repository_skill_requires_explicit_authorization_or_confirmation(self) -> None:
+        text = self.canonical_text().lower()
+        self.assertIn("explicit request", text)
+        self.assertIn("bare `delegate` or `consult`", text)
+        self.assertRegex(text, r"bare `delegate` or `consult`[\s\S]{0,180}not launch authorization")
+        self.assertRegex(text, r"heuristic[\s\S]{0,300}confirm")
+        self.assertIn("external cli", text)
+        self.assertRegex(text, r"user[\s\S]{0,200}prohibit")
+        self.assertRegex(text, r"project[\s\S]{0,200}prohibit")
+        self.assertIn("do not launch", text)
+
+    def test_repository_skill_routes_only_to_a_verified_peer(self) -> None:
+        text = self.canonical_text().lower()
+        self.assertIn(
+            "user instruction > project rules > verified local capability > heuristic",
+            text,
+        )
+        self.assertIn("codex orchestrator targets claude", text)
+        self.assertIn("claude code orchestrator targets codex", text)
+        self.assertIn("never target itself", text)
+        self.assertIn("verify", text)
+        self.assertIn("$imagegen", text)
+        self.assertIn("do not promise image generation", text)
+
+    def test_canonical_docs_contain_no_unsafe_claims_or_git_mutation_instructions(self) -> None:
+        markdown = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted(CANONICAL_SKILL.rglob("*.md"))
+        )
+        for forbidden in (
+            "latest GPT",
+            "成本不设限",
+            "机制级",
+            "mechanism-level read-only",
+            "guaranteed consensus",
+            "writes are impossible",
+        ):
+            self.assertNotIn(forbidden.lower(), markdown.lower())
+        self.assertIsNone(
+            re.search(r"\bgit\s+(?:commit|stash|reset|clean|push)\b", markdown, re.IGNORECASE)
+        )
+
+    def test_delegate_reference_states_audit_boundary_modes_and_success_contract(self) -> None:
+        text = self.canonical_text("references/delegate.md")
+        lower = text.lower()
+        for required in (
+            "tracked",
+            "non-ignored untracked",
+            "git metadata",
+            "git-ignored",
+            "not an os sandbox",
+            "cccc_allow_dirty=1",
+            "cccc_allow_full=1",
+            "edit",
+            "auto",
+            "full",
+            "exit status 0",
+        ):
+            self.assertIn(required, lower)
+        self.assertIn("../assets/task-card.md", text)
+        self.assertIn("scripts/delegate.sh", text)
+        self.assertIn("for codex", lower)
+        self.assertIn("network_access=false", lower)
+        self.assertRegex(lower, r"claude[\s\S]{0,180}does not establish network isolation")
+
+    def test_consult_reference_states_real_boundary_and_codex_has_no_add_dir(self) -> None:
+        text = self.canonical_text("references/consult.md")
+        lower = text.lower()
+        for required in (
+            "strict",
+            "inherit",
+            "private cwd",
+            "absolute repository path",
+            "not an os sandbox",
+            "same-uid",
+            "not guaranteed",
+            "globally readable",
+            "external container",
+            "isolated worktree",
+            "exit status 0",
+        ):
+            self.assertIn(required, lower)
+        self.assertNotIn("--add-dir", text)
+        self.assertIn("../assets/discussion-card.md", text)
+        self.assertIn("scripts/consult.sh", text)
+
+        design = (REPOSITORY_ROOT / "docs/superpowers/specs/2026-08-11-cccc-v2-design.md").read_text(encoding="utf-8")
+        design_consult = design.split("## consult 设计", 1)[1].split("## 超时与进程清理", 1)[0]
+        plan = (REPOSITORY_ROOT / "docs/superpowers/plans/2026-08-11-cccc-v2.md").read_text(encoding="utf-8")
+        plan_consult = plan.split("## Task 5:", 1)[1].split("## Task 6:", 1)[0]
+        self.assertNotIn("--add-dir", design_consult)
+        self.assertNotIn("--add-dir", plan_consult)
+
+    def test_setup_and_troubleshooting_cover_required_operations_without_secrets(self) -> None:
+        setup = self.canonical_text("references/setup.md")
+        for required in (
+            "codex login status",
+            "codex login --with-api-key",
+            "claude auth status",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "~/.claude/skills/cccc",
+            "~/.agents/skills/cccc",
+            "~/.codex/skills/cccc",
+            "Junction",
+            "rollback",
+        ):
+            self.assertIn(required, setup)
+        self.assertRegex(setup, r"(?m)^.*\|\s*codex login --with-api-key\s*$")
+        self.assertIn("Windows CI must pass before release", setup)
+        self.assertNotIn("is verified by the repository's Windows CI", setup)
+        troubleshooting = self.canonical_text("references/troubleshooting.md").lower()
+        for required in (
+            "124",
+            "python",
+            "authentication",
+            "model",
+            "effort",
+            "output collision",
+            "policy failure",
+            "legacy path",
+        ):
+            self.assertIn(required, troubleshooting)
+        self.assertRegex(troubleshooting, r"\| `5` \|[^\n]*(?:empty|unsafe)")
+        self.assertRegex(troubleshooting, r"\| `70` \|[^\n]*peer[^\n]*(?:exit|signal)")
+
+    def test_legacy_root_skill_entrypoints_are_removed(self) -> None:
+        for legacy in ("SKILL.md", "agents/openai.yaml", "references/setup.md"):
+            self.assertFalse((REPOSITORY_ROOT / legacy).exists(), legacy)
+        metadata = self.canonical_text("agents/openai.yaml")
+        self.assertNotIn("allow_implicit_invocation: false", metadata)
+        self.assertIn("$cccc", metadata)
 
     def test_name_must_match_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
