@@ -17,6 +17,28 @@ if [ -r "$COMMON" ]; then
   fi
 fi
 
+test_harness_isolates_home_and_git_config() {
+  case "$HOME/" in
+    "$TEST_TMP_ROOT/"*) ;;
+    *) test_diag "HOME is outside test root: $HOME"; return 1 ;;
+  esac
+  case "$XDG_CONFIG_HOME/" in
+    "$TEST_TMP_ROOT/"*) ;;
+    *) test_diag "XDG_CONFIG_HOME is outside test root: $XDG_CONFIG_HOME"; return 1 ;;
+  esac
+  [ -d "$HOME" ] && [ -d "$XDG_CONFIG_HOME" ] || return 1
+  assert_eq 1 "${GIT_CONFIG_NOSYSTEM-}" "Git system config isolation" || return 1
+  assert_eq "$HOME" "${USERPROFILE-}" "Windows home isolation" || return 1
+  [ -z "${GIT_CONFIG_GLOBAL-}" ] || return 1
+  bash -c '
+    [ "$HOME" = "$1" ] &&
+    [ "$XDG_CONFIG_HOME" = "$2" ] &&
+    [ "$USERPROFILE" = "$1" ] &&
+    [ "$GIT_CONFIG_NOSYSTEM" = 1 ] &&
+    [ -z "${GIT_CONFIG_GLOBAL-}" ]
+  ' _ "$HOME" "$XDG_CONFIG_HOME"
+}
+
 test_common_library_exists() {
   [ "$COMMON_LOADED" -eq 1 ] || {
     test_diag "missing $COMMON"
@@ -605,6 +627,7 @@ test_common_uses_bash_3_2_safe_constructs() {
   fi
 }
 
+run_test "shell harness isolates HOME and Git configuration" test_harness_isolates_home_and_git_config
 run_test "common safety library exists and is sourceable" test_common_library_exists
 run_test "target is exactly claude or codex" test_target_is_exact
 run_test "diagnostics and required commands return to caller" test_diagnostics_and_required_commands_return
