@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import tempfile
 import unittest
 import re
@@ -197,6 +199,141 @@ class ValidateSkillTests(unittest.TestCase):
         metadata = self.canonical_text("agents/openai.yaml")
         self.assertNotIn("allow_implicit_invocation: false", metadata)
         self.assertIn("$cccc", metadata)
+
+    def test_repository_line_endings_are_portable(self) -> None:
+        attributes = (REPOSITORY_ROOT / ".gitattributes").read_text(encoding="utf-8")
+        self.assertIn("* text=auto", attributes)
+        self.assertIn("*.sh text eol=lf", attributes)
+        self.assertIn("*.py text eol=lf", attributes)
+
+    def test_ci_runs_the_complete_cross_platform_suite(self) -> None:
+        workflow_path = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
+        self.assertTrue(workflow_path.is_file())
+        workflow = workflow_path.read_text(encoding="utf-8")
+        for runner in ("ubuntu-latest", "macos-latest", "windows-latest"):
+            self.assertIn(runner, workflow)
+        for command in (
+            "unittest discover -s tests -p 'test_*.py' -v",
+            "bash tests/test_common.sh",
+            "bash tests/test_delegate.sh",
+            "bash tests/test_consult.sh",
+        ):
+            self.assertIn(command, workflow)
+        self.assertRegex(workflow, r"(?m)^\s*shell:\s*bash\s*$")
+        self.assertIn("CCCC_REQUIRE_WINDOWS_NATIVE", workflow)
+        self.assertIn("actions/checkout@", workflow)
+        self.assertIn("actions/setup-python@", workflow)
+        self.assertNotRegex(workflow, r"(?m)^\s*(?:pip|pip3|uv)\s+install\b")
+
+        for shell_suite in ("test_delegate.sh", "test_consult.sh"):
+            suite = (REPOSITORY_ROOT / "tests" / shell_suite).read_text(encoding="utf-8")
+            self.assertIn("CCCC_REQUIRE_WINDOWS_NATIVE", suite)
+
+    def test_readme_uses_canonical_install_and_safe_migration(self) -> None:
+        readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+        lower = readme.lower()
+        for required in (
+            "skills/cccc",
+            "~/.agents/skills/cccc",
+            "~/.claude/skills/cccc",
+            "junction",
+            "rollback",
+            "uninstall",
+            "restart",
+            "fallback",
+        ):
+            self.assertIn(required, lower)
+        self.assertRegex(lower, r"~/.codex/skills/cccc[\s\S]{0,120}legacy")
+        self.assertIn("git clone", lower)
+        self.assertGreaterEqual(lower.count("new-item -itemtype junction"), 2)
+        self.assertRegex(lower, r"restart[\s\S]{0,120}fallback|fallback[\s\S]{0,120}restart")
+        self.assertRegex(lower, r"uninstall[\s\S]{0,500}(?:keep|preserve|do not delete)")
+        update = lower.split("## update, rollback, and uninstall", 1)[1]
+        self.assertNotIn("pull --ff-only", update)
+        self.assertIn("candidate", update)
+        self.assertIn("readlink", update)
+        self.assertIn(".rollback", update)
+        self.assertRegex(update, r"candidate[\s\S]+validate[\s\S]+switch")
+        self.assertRegex(update, r"validation fails[\s\S]+(?:keep|preserve)")
+        update_script = update.split("```bash", 1)[1].split("```", 1)[0]
+        self.assertIn("set -eu", update_script)
+        self.assertLess(update_script.index("set -eu"), update_script.index("validate_skill.py"))
+        self.assertRegex(update_script, r"release_id=.*(?:date|\$\$)")
+        self.assertRegex(update_script, r"candidate=.*\$release_id")
+        self.assertIn("recover_switch", update_script)
+        self.assertIn("trap 'recover_switch $?' exit", update_script)
+        self.assertLess(
+            update_script.index("trap 'recover_switch $?' exit"),
+            update_script.index('mv "$codex_live" "$codex_backup"'),
+        )
+        self.assertNotIn('candidate="$base/cccc-skill.candidate"', update_script)
+        for reference in ("delegate", "consult", "setup", "troubleshooting"):
+            self.assertIn(f"skills/cccc/references/{reference}.md", readme)
+        for forbidden in (
+            "latest GPT",
+            "成本不设限",
+            "机制级",
+            "writes are impossible",
+            "guaranteed consensus",
+        ):
+            self.assertNotIn(forbidden.lower(), lower)
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX symlink semantics")
+    def test_readme_update_recovers_signal_after_completed_link_move(self) -> None:
+        readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+        update = readme.split("## Update, rollback, and uninstall", 1)[1]
+        script = update.split("```bash", 1)[1].split("```", 1)[0]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            home = root / "home"
+            data = root / "data"
+            fake_bin = root / "bin"
+            marker = root / "mv-signaled"
+            codex_live = home / ".agents" / "skills" / "cccc"
+            claude_live = home / ".claude" / "skills" / "cccc"
+            old_codex = root / "old-codex" / "skills" / "cccc"
+            old_claude = root / "old-claude" / "skills" / "cccc"
+            for path in (codex_live.parent, claude_live.parent, old_codex, old_claude, data, fake_bin):
+                path.mkdir(parents=True, exist_ok=True)
+            codex_live.symlink_to(old_codex)
+            claude_live.symlink_to(old_claude)
+            (root / "update.sh").write_text(script, encoding="utf-8")
+            (fake_bin / "git").write_text(
+                "#!/usr/bin/env bash\nset -eu\n"
+                "[ \"$1\" = clone ]\nmkdir -p \"$3/skills/cccc\" \"$3/tests\"\n",
+                encoding="utf-8",
+            )
+            (fake_bin / "python3").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            (fake_bin / "mv").write_text(
+                "#!/usr/bin/env bash\nset -eu\n/bin/mv \"$@\"\n"
+                "if [ ! -e \"$CCCC_MV_SIGNAL_MARKER\" ]; then\n"
+                "  : >\"$CCCC_MV_SIGNAL_MARKER\"\n"
+                "  kill -HUP \"$PPID\"\n"
+                "fi\n",
+                encoding="utf-8",
+            )
+            for executable in (fake_bin / "git", fake_bin / "python3", fake_bin / "mv"):
+                executable.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                HOME=str(home),
+                XDG_DATA_HOME=str(data),
+                CCCC_MV_SIGNAL_MARKER=str(marker),
+                PATH=f"{fake_bin}:/usr/bin:/bin",
+            )
+            result = subprocess.run(
+                ["bash", str(root / "update.sh")],
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=10,
+            )
+            self.assertEqual(129, result.returncode, result.stderr)
+            self.assertTrue(marker.is_file(), "mv signal injection did not fire")
+            self.assertTrue(codex_live.is_symlink(), "Codex live link was not restored")
+            self.assertTrue(claude_live.is_symlink(), "Claude live link was not preserved")
+            self.assertEqual(old_codex.resolve(), codex_live.resolve())
+            self.assertEqual(old_claude.resolve(), claude_live.resolve())
 
     def test_name_must_match_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            require_windows_native: "0"
+          - os: macos-latest
+            require_windows_native: "0"
+          - os: windows-latest
+            require_windows_native: "1"
+    env:
+      CCCC_REQUIRE_WINDOWS_NATIVE: ${{ matrix.require_windows_native }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Verify runtimes
+        run: |
+          python --version
+          python3 --version
+          bash --version
+          git --version
+      - name: Python tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Common shell tests
+        run: bash tests/test_common.sh
+      - name: Delegate shell tests
+        run: bash tests/test_delegate.sh
+      - name: Consult shell tests
+        run: bash tests/test_consult.sh
+      - name: Validate canonical skill
+        run: python tests/validate_skill.py skills/cccc

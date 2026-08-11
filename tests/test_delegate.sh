@@ -2461,7 +2461,13 @@ WINDOWS_COMMON_GIT_SHIM
 }
 
 test_windows_native_status_mode_allows_normal_execution() {
-  require_windows_git_bash || return 77
+  if ! require_windows_git_bash; then
+    [ "${CCCC_REQUIRE_WINDOWS_NATIVE-}" = 1 ] && {
+      test_diag 'Windows native delegate coverage was required but Git Bash was not detected'
+      return 1
+    }
+    return 77
+  fi
   prepare_case || return 1
   run_delegate codex
   assert_success_outputs
@@ -2469,7 +2475,13 @@ test_windows_native_status_mode_allows_normal_execution() {
 
 test_windows_uint_child_exit_maps_to_agent_failure() {
   local real_python
-  require_windows_git_bash || return 77
+  if ! require_windows_git_bash; then
+    [ "${CCCC_REQUIRE_WINDOWS_NATIVE-}" = 1 ] && {
+      test_diag 'Windows native DWORD coverage was required but Git Bash was not detected'
+      return 1
+    }
+    return 77
+  fi
   prepare_case || return 1
   real_python=$(command -v python3)
   cat >"$CASE_BIN/python3" <<'WINDOWS_LARGE_STATUS_SHIM'

@@ -2250,7 +2250,13 @@ PY
 test_windows_native_execution_or_explicit_platform_skip() {
   case ${MSYSTEM-}:$(uname -s 2>/dev/null || true) in
     MINGW*:MINGW*|MSYS*:MSYS*|UCRT*:MINGW*) ;;
-    *) return 77 ;;
+    *)
+      [ "${CCCC_REQUIRE_WINDOWS_NATIVE-}" = 1 ] && {
+        test_diag 'Windows native consult coverage was required but Git Bash was not detected'
+        return 1
+      }
+      return 77
+      ;;
   esac
   prepare_case || return 1
   run_consult codex
