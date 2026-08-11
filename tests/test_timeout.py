@@ -184,6 +184,78 @@ class TimeoutRunnerTests(unittest.TestCase):
 
 
 class TimeoutRunnerUnitTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal semantics")
+    def test_signal_at_popen_boundary_is_cleaned_after_child_is_owned(self):
+        process = mock.Mock()
+        process.wait.return_value = 0
+        seen_signals = []
+        previous = signal.getsignal(signal.SIGTERM)
+
+        def harmless_previous_handler(signum, _frame):
+            seen_signals.append(signum)
+
+        def launch_at_signal_boundary(*_args, **_kwargs):
+            signal.raise_signal(signal.SIGTERM)
+            return process
+
+        try:
+            signal.signal(signal.SIGTERM, harmless_previous_handler)
+            with mock.patch.object(
+                RUNNER_MODULE.subprocess, "Popen", side_effect=launch_at_signal_boundary
+            ), mock.patch.object(RUNNER_MODULE, "stop_process", return_value=None) as stop:
+                status = RUNNER_MODULE.run(["1", "--", "child"])
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
+        self.assertEqual(status, -signal.SIGTERM)
+        stop.assert_called_once_with(process, None)
+        self.assertEqual(seen_signals, [])
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal semantics")
+    def test_popen_failure_restores_previous_signal_handler(self):
+        previous = signal.getsignal(signal.SIGTERM)
+        with mock.patch.object(
+            RUNNER_MODULE.subprocess, "Popen", side_effect=OSError("launch failed")
+        ):
+            RUNNER_MODULE.run(["1", "--", "child"])
+        self.assertIs(signal.getsignal(signal.SIGTERM), previous)
+
+    def test_windows_launch_is_suspended_before_job_assignment(self):
+        process = mock.Mock()
+        process.wait.return_value = 0
+        job = mock.Mock()
+        job.close.return_value = None
+        launches = []
+
+        def launch(_command, **options):
+            launches.append(options)
+            return process
+
+        with mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
+             mock.patch.object(
+                 RUNNER_MODULE.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
+             ), \
+             mock.patch.object(RUNNER_MODULE.subprocess, "Popen", side_effect=launch), \
+             mock.patch.object(RUNNER_MODULE, "create_windows_job", return_value=(job, None)):
+            status = RUNNER_MODULE.run(["0", "--", "child"])
+
+        self.assertEqual(status, 0)
+        self.assertTrue(launches[0]["creationflags"] & 0x00000004)
+
+    def test_windows_assignment_failure_never_resumes_suspended_target(self):
+        process = mock.Mock()
+        job = mock.Mock()
+        job.assign.side_effect = OSError("assignment denied")
+        with mock.patch.object(RUNNER_MODULE, "WindowsJob", return_value=job), \
+             mock.patch.object(RUNNER_MODULE, "stop_windows", return_value=None) as stop, \
+             mock.patch.object(RUNNER_MODULE, "resume_windows_process") as resume:
+            assigned_job, error = RUNNER_MODULE.create_windows_job(process)
+
+        self.assertIsNone(assigned_job)
+        self.assertIn("assignment failed", error)
+        resume.assert_not_called()
+        stop.assert_called_once_with(process, job)
+
     @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
     def test_posix_grace_sleep_never_passes_deadline(self):
         process = mock.Mock()
@@ -349,7 +421,7 @@ class WindowsTimeoutTests(unittest.TestCase):
         self.assertEqual(result.returncode, 124)
         self.assertIn(b"cccc-timeout:", result.stderr)
 
-    def test_timeout_removes_child_process_tree(self):
+    def test_timeout_removes_immediately_spawned_process_tree(self):
         tree = (
             "import os, subprocess, sys, time;"
             "grandchild = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']);"

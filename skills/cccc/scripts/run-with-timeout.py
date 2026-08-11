@@ -13,6 +13,7 @@ CLEANUP_GRACE_SECONDS = 2
 POLL_INTERVAL_SECONDS = 0.05
 # Keep the timeout safely representable as milliseconds on every supported platform.
 MAX_TIMEOUT_SECONDS = min(sys.maxsize // 1000, (2**31 - 1) // 1000)
+WINDOWS_CREATE_SUSPENDED = 0x00000004
 
 
 class RunnerInterrupted(Exception):
@@ -20,6 +21,14 @@ class RunnerInterrupted(Exception):
 
     def __init__(self, signum):
         self.signum = signum
+
+
+class InterruptState:
+    """Records a pre-launch signal until the newly-created child is owned."""
+
+    def __init__(self):
+        self.process = None
+        self.signum = None
 
 
 def fail(message):
@@ -219,16 +228,32 @@ def stop_windows(process, job=None):
     return join_cleanup_errors(*errors) or None
 
 
+def resume_windows_process(process):
+    """Release a CREATE_SUSPENDED process only after it belongs to the Job Object."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+    kernel32.ResumeThread.restype = wintypes.DWORD
+    if kernel32.ResumeThread(process._thread) == 0xFFFFFFFF:
+        return f"could not resume suspended process: {ctypes.WinError(ctypes.get_last_error())}"
+    return None
+
+
 def install_interrupt_handlers():
+    state = InterruptState()
     previous = {}
 
     def interrupted(signum, _frame):
-        raise RunnerInterrupted(signum)
+        state.signum = signum
+        if state.process is not None:
+            raise RunnerInterrupted(signum)
 
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         previous[signum] = signal.getsignal(signum)
         signal.signal(signum, interrupted)
-    return previous
+    return state, previous
 
 
 def restore_interrupt_handlers(previous):
@@ -253,12 +278,15 @@ def create_windows_job(process):
     try:
         job = WindowsJob()
         job.assign(process)
-        return job, None
+        resume_error = resume_windows_process(process)
+        if not resume_error:
+            return job, None
+        cleanup_error = stop_windows(process, job)
+        return None, join_cleanup_errors(resume_error, cleanup_error)
     except OSError as exc:
-        close_error = job.close() if job is not None else None
-        cleanup_error = stop_windows(process)
+        cleanup_error = stop_windows(process, job)
         return None, join_cleanup_errors(
-            f"Windows Job Object assignment failed: {exc}", close_error, cleanup_error
+            f"Windows Job Object assignment failed: {exc}", cleanup_error
         )
 
 
@@ -271,41 +299,72 @@ def run(argv):
     if os.name == "posix":
         options["start_new_session"] = True
     elif os.name == "nt":
-        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        # Assign while suspended so the command cannot spawn descendants before joining the Job.
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | WINDOWS_CREATE_SUSPENDED
 
-    try:
-        process = subprocess.Popen(command, **options)
-    except OSError as exc:
-        print(f"cccc-timeout: cannot start command: {exc}", file=sys.stderr)
-        return 127
-
+    interrupt_state = None
+    previous_handlers = None
     job = None
-    if os.name == "nt":
-        job, error = create_windows_job(process)
-        if error:
-            return cleanup_failed(error)
-
-    previous_handlers = install_interrupt_handlers() if os.name == "posix" else None
     result = None
+    process = None
+    if os.name == "posix":
+        interrupt_state, previous_handlers = install_interrupt_handlers()
     try:
         try:
-            result = process.wait() if seconds == 0 else process.wait(timeout=seconds)
+            process = subprocess.Popen(command, **options)
+            if interrupt_state is not None:
+                interrupt_state.process = process
+                if interrupt_state.signum is not None:
+                    raise RunnerInterrupted(interrupt_state.signum)
+            if os.name == "nt":
+                job, error = create_windows_job(process)
+                if error:
+                    result = cleanup_failed(error)
+                else:
+                    result = process.wait() if seconds == 0 else process.wait(timeout=seconds)
+            else:
+                result = process.wait() if seconds == 0 else process.wait(timeout=seconds)
+            if interrupt_state is not None:
+                interrupt_state.process = None
         except subprocess.TimeoutExpired:
             print(f"cccc-timeout: command exceeded {seconds} seconds", file=sys.stderr)
+            if interrupt_state is not None:
+                interrupt_state.process = None
             error = stop_process(process, job)
             result = cleanup_failed(error) if error else 124
         except OverflowError:
+            if interrupt_state is not None:
+                interrupt_state.process = None
             error = stop_process(process, job)
             if error:
                 result = cleanup_failed(error)
             else:
                 result = fail(f"seconds must be no greater than {MAX_TIMEOUT_SECONDS}")
         except RunnerInterrupted as interrupted:
+            interrupt_state.process = None
             error = stop_process(process, job)
             result = cleanup_failed(error) if error else -interrupted.signum
+        except OSError as exc:
+            if process is None:
+                if interrupt_state is not None and interrupt_state.signum is not None:
+                    result = -interrupt_state.signum
+                else:
+                    print(f"cccc-timeout: cannot start command: {exc}", file=sys.stderr)
+                    result = 127
+            else:
+                if interrupt_state is not None:
+                    interrupt_state.process = None
+                cleanup_error = stop_process(process, job)
+                result = cleanup_failed(
+                    join_cleanup_errors(f"process lifecycle failed: {exc}", cleanup_error)
+                )
     finally:
+        if interrupt_state is not None:
+            interrupt_state.process = None
         if previous_handlers is not None:
             restore_interrupt_handlers(previous_handlers)
+            if interrupt_state.signum is not None and result != 125:
+                result = -interrupt_state.signum
         if job is not None:
             close_error = job.close()
             if close_error:
