@@ -2,8 +2,11 @@
 
 import os
 from pathlib import Path
+import signal
+import io
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -87,6 +90,39 @@ class TimeoutRunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 124)
         self.assertNotIn(b"cccc-timeout:", result.stderr)
 
+    def test_rejects_oversized_timeout_without_starting_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sentinel = Path(directory) / "started"
+            result = subprocess.run(
+                command(
+                    "9" * 5000,
+                    "--",
+                    *child(
+                        "from pathlib import Path; import sys; "
+                        "Path(sys.argv[1]).write_text('started')"
+                    ),
+                    str(sentinel),
+                ),
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(b"no greater than", result.stderr)
+            self.assertFalse(sentinel.exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal semantics")
+    def test_natural_child_signal_preserves_sigterm_semantics(self):
+        result = self.run_runner(
+            2, *child("import os, signal; os.kill(os.getpid(), signal.SIGTERM)")
+        )
+        self.assertEqual(result.returncode, -signal.SIGTERM)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal semantics")
+    def test_natural_child_signal_preserves_sigkill_semantics(self):
+        result = self.run_runner(
+            2, *child("import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
+        )
+        self.assertEqual(result.returncode, -signal.SIGKILL)
+
 
 class TimeoutRunnerUnitTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
@@ -104,7 +140,7 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
             [call.args[1] for call in killpg.call_args_list],
             [RUNNER_MODULE.signal.SIGTERM, RUNNER_MODULE.signal.SIGKILL],
         )
-        process.wait.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=2)
 
     def test_windows_timeout_kills_after_terminate_grace_expires(self):
         process = mock.Mock()
@@ -113,8 +149,71 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         RUNNER_MODULE.stop_windows(process)
 
         process.terminate.assert_called_once_with()
-        self.assertEqual(process.wait.call_args_list, [mock.call(timeout=2), mock.call()])
+        self.assertEqual(process.wait.call_args_list, [mock.call(timeout=2), mock.call(timeout=2)])
         process.kill.assert_called_once_with()
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_timeout_cleanup_failure_returns_125_with_diagnostic(self):
+        process = mock.Mock()
+        process.wait.side_effect = subprocess.TimeoutExpired(["child"], 1)
+        stderr = io.StringIO()
+        with mock.patch.object(RUNNER_MODULE.subprocess, "Popen", return_value=process), \
+             mock.patch.object(RUNNER_MODULE, "stop_process", return_value="SIGTERM failed: denied"), \
+             mock.patch.object(RUNNER_MODULE.sys, "stderr", stderr):
+            status = RUNNER_MODULE.run(["1", "--", "child"])
+
+        self.assertEqual(status, 125)
+        self.assertIn("cccc-timeout: command exceeded 1 seconds", stderr.getvalue())
+        self.assertIn("cccc-timeout: cleanup failed: SIGTERM failed: denied", stderr.getvalue())
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_wait_overflow_returns_validation_error_after_cleanup(self):
+        process = mock.Mock()
+        process.wait.side_effect = OverflowError("timeout out of range")
+        stderr = io.StringIO()
+        with mock.patch.object(RUNNER_MODULE.subprocess, "Popen", return_value=process), \
+             mock.patch.object(RUNNER_MODULE, "stop_process", return_value=None), \
+             mock.patch.object(RUNNER_MODULE.sys, "stderr", stderr):
+            status = RUNNER_MODULE.run(["1", "--", "child"])
+
+        self.assertEqual(status, 2)
+        self.assertIn("no greater than", stderr.getvalue())
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_posix_term_permission_failure_has_bounded_reap(self):
+        process = mock.Mock()
+        with mock.patch.object(
+            RUNNER_MODULE.os, "killpg", side_effect=PermissionError("denied")
+        ):
+            error = RUNNER_MODULE.stop_posix(process)
+
+        self.assertIn("SIGTERM", error)
+        process.wait.assert_called_once_with(timeout=2)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_posix_kill_permission_failure_has_bounded_reap(self):
+        process = mock.Mock()
+        with mock.patch.object(RUNNER_MODULE, "process_group_exists", return_value=True), \
+             mock.patch.object(
+                 RUNNER_MODULE.os, "killpg", side_effect=[None, PermissionError("denied")]
+             ), \
+             mock.patch.object(RUNNER_MODULE.time, "monotonic", side_effect=[0, 2]):
+            error = RUNNER_MODULE.stop_posix(process)
+
+        self.assertIn("SIGKILL", error)
+        process.wait.assert_called_once_with(timeout=2)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_posix_non_reap_after_kill_returns_cleanup_failure(self):
+        process = mock.Mock()
+        process.wait.side_effect = subprocess.TimeoutExpired(["child"], 2)
+        with mock.patch.object(RUNNER_MODULE, "process_group_exists", return_value=True), \
+             mock.patch.object(RUNNER_MODULE.os, "killpg"), \
+             mock.patch.object(RUNNER_MODULE.time, "monotonic", side_effect=[0, 2]):
+            error = RUNNER_MODULE.stop_posix(process)
+
+        self.assertIn("did not exit", error)
+        process.wait.assert_called_once_with(timeout=2)
 
 
 @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
@@ -158,6 +257,27 @@ class PosixProcessGroupTests(unittest.TestCase):
         self.assertGreaterEqual(time.monotonic() - started, 2)
         self.assert_pids_gone(*pids)
 
+    def test_runner_interrupt_cleans_descendants_and_preserves_signal(self):
+        child_code = (
+            "import os, subprocess, sys, time;"
+            "grandchild = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']);"
+            "print(f'{os.getpid()} {grandchild.pid}', flush=True);"
+            "time.sleep(30)"
+        )
+        for interrupted_by in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(interrupted_by=interrupted_by):
+                runner = subprocess.Popen(
+                    command("0", "--", *child(child_code)),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                parent_pid, grandchild_pid = map(int, runner.stdout.readline().split())
+                os.kill(runner.pid, interrupted_by)
+                _, stderr = runner.communicate(timeout=8)
+
+                self.assertEqual(runner.returncode, -interrupted_by, stderr.decode(errors="replace"))
+                self.assert_pids_gone(parent_pid, grandchild_pid)
+
 
 @unittest.skipUnless(os.name == "nt", "requires Windows process handling")
 class WindowsTimeoutTests(unittest.TestCase):
@@ -169,6 +289,25 @@ class WindowsTimeoutTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 124)
         self.assertIn(b"cccc-timeout:", result.stderr)
+
+    def test_timeout_removes_child_process_tree(self):
+        tree = (
+            "import os, subprocess, sys, time;"
+            "grandchild = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']);"
+            "print(f'{os.getpid()} {grandchild.pid}', flush=True);"
+            "time.sleep(30)"
+        )
+        result = subprocess.run(
+            command("1", "--", *child(tree)), capture_output=True, timeout=10
+        )
+        self.assertEqual(result.returncode, 124)
+        parent_pid, grandchild_pid = map(int, result.stdout.split())
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if pid_is_gone(parent_pid) and pid_is_gone(grandchild_pid):
+                return
+            time.sleep(0.05)
+        self.fail(f"processes still exist: {(parent_pid, grandchild_pid)}")
 
 
 if __name__ == "__main__":
