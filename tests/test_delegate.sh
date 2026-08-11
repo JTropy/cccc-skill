@@ -356,7 +356,15 @@ try:
         fail("token is not regular")
     if (token_before.st_dev, token_before.st_ino) != (token_opened.st_dev, token_opened.st_ino):
         fail("token identity changed while opening")
-    token = os.read(token_fd, 33)
+    token_chunks = []
+    token_remaining = 33
+    while token_remaining:
+        token_chunk = os.read(token_fd, token_remaining)
+        if not token_chunk:
+            break
+        token_chunks.append(token_chunk)
+        token_remaining -= len(token_chunk)
+    token = b"".join(token_chunks)
 finally:
     os.close(token_fd)
 if len(token) != 32:
@@ -1659,7 +1667,15 @@ import time
 status_file, token_file, barrier = sys.argv[1:]
 token_fd = os.open(token_file, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
 try:
-    token = os.read(token_fd, 33)
+    token_chunks = []
+    token_remaining = 33
+    while token_remaining:
+        token_chunk = os.read(token_fd, token_remaining)
+        if not token_chunk:
+            break
+        token_chunks.append(token_chunk)
+        token_remaining -= len(token_chunk)
+    token = b"".join(token_chunks)
 finally:
     os.close(token_fd)
 if len(token) != 32:
