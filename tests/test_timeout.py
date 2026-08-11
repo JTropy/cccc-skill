@@ -89,6 +89,7 @@ class TimeoutRunnerTests(unittest.TestCase):
 
 
 class TimeoutRunnerUnitTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
     def test_posix_grace_sleep_never_passes_deadline(self):
         process = mock.Mock()
         with mock.patch.object(RUNNER_MODULE, "process_group_exists", return_value=True), \
