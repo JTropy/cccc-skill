@@ -638,7 +638,13 @@ class PublishNoClobberTests(unittest.TestCase):
 
         self.assertEqual(5, result)
         self.assertFalse(os.path.lexists(destination))
-        self.assertEqual(b"original", moved.read_bytes())
+        if moved.exists():
+            self.assertEqual(b"original", moved.read_bytes())
+        else:
+            # Windows may keep the opened source path bound while the callback
+            # replaces its contents; the security property is still that the
+            # changed source is detected and never published.
+            self.assertEqual(b"replacement", source.read_bytes())
         self.assert_no_temps()
 
     def test_primary_failure_also_warns_when_owned_temp_cleanup_fails(self) -> None:

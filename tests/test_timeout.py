@@ -289,7 +289,10 @@ class TimeoutRunnerTests(unittest.TestCase):
     def test_timeout_returns_124_and_marker(self):
         result = self.run_runner(1, *child("import time; time.sleep(5)"), timeout=8)
         self.assertEqual(result.returncode, 124)
-        self.assertEqual(result.stderr, b"cccc-timeout: command exceeded 1 seconds\n")
+        self.assertEqual(
+            result.stderr.replace(b"\r\n", b"\n"),
+            b"cccc-timeout: command exceeded 1 seconds\n",
+        )
 
     def test_natural_124_is_not_a_timeout(self):
         result = self.run_runner(2, *child("import sys; sys.exit(124)"))
@@ -693,7 +696,10 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
             return job, None, None
 
         gate.set.side_effect = lambda: events.append("set") or None
-        with mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
+        with mock.patch.object(
+                 RUNNER_MODULE, "resolve_windows_command", side_effect=lambda command: (command, None)
+             ), \
+             mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
              mock.patch.object(
                  RUNNER_MODULE.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
              ), \
@@ -894,7 +900,10 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         gate = mock.Mock()
         gate.name = "Local\\cccc-test-gate"
         gate.close.return_value = None
-        with mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
+        with mock.patch.object(
+                 RUNNER_MODULE, "resolve_windows_command", side_effect=lambda command: (command, None)
+             ), \
+             mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
              mock.patch.object(
                  RUNNER_MODULE.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
              ), \
@@ -909,7 +918,10 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         gate.set.assert_not_called()
 
     def test_windows_gate_creation_failure_is_setup_error(self):
-        with mock.patch.object(RUNNER_MODULE, "WindowsGate", side_effect=OSError("gate failed")), \
+        with mock.patch.object(
+                 RUNNER_MODULE, "resolve_windows_command", side_effect=lambda command: (command, None)
+             ), \
+             mock.patch.object(RUNNER_MODULE, "WindowsGate", side_effect=OSError("gate failed")), \
              mock.patch.object(RUNNER_MODULE.subprocess, "Popen") as launch:
             bootstrap, gate, job, error, status = RUNNER_MODULE.launch_windows_bootstrap(["target"])
 
@@ -924,7 +936,10 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         gate = mock.Mock()
         gate.name = "Local\\cccc-test-gate"
         gate.close.return_value = None
-        with mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
+        with mock.patch.object(
+                 RUNNER_MODULE, "resolve_windows_command", side_effect=lambda command: (command, None)
+             ), \
+             mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
              mock.patch.object(
                  RUNNER_MODULE.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
              ), \
@@ -939,7 +954,10 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         gate = mock.Mock()
         gate.name = "Local\\cccc-test-gate"
         gate.close.return_value = "could not close Windows bootstrap gate"
-        with mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
+        with mock.patch.object(
+                 RUNNER_MODULE, "resolve_windows_command", side_effect=lambda command: (command, None)
+             ), \
+             mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
              mock.patch.object(
                  RUNNER_MODULE.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
              ), \
@@ -955,7 +973,10 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         gate = mock.Mock()
         gate.name = "Local\\cccc-test-gate"
         gate.close.return_value = None
-        with mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
+        with mock.patch.object(
+                 RUNNER_MODULE, "resolve_windows_command", side_effect=lambda command: (command, None)
+             ), \
+             mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
              mock.patch.object(
                  RUNNER_MODULE.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
              ), \
