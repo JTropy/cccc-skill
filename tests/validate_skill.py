@@ -44,7 +44,7 @@ def _parse_scalar(value: str) -> str:
 def _strip_plain_scalar_comment(value: str) -> str:
     """Remove a YAML comment marker only when whitespace precedes it."""
     for index, character in enumerate(value):
-        if character == "#" and index > 0 and value[index - 1].isspace():
+        if character == "#" and (index == 0 or value[index - 1].isspace()):
             return value[:index].rstrip()
     return value
 

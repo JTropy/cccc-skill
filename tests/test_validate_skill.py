@@ -173,6 +173,27 @@ class ValidateSkillTests(unittest.TestCase):
             )
             self.assertIn("must contain $cccc", "\n".join(self.validate(skill_path)))
 
+    def test_rejects_description_that_is_only_a_plain_yaml_comment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_path = self.make_skill(
+                Path(temp_dir),
+                frontmatter="---\nname: cccc\ndescription: # comment only\n---\n",
+            )
+            self.assertIn("1..1024", "\n".join(self.validate(skill_path)))
+
+    def test_rejects_default_prompt_that_is_only_a_plain_yaml_comment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_path = self.make_skill(
+                Path(temp_dir),
+                openai_yaml=(
+                    "interface:\n"
+                    "  display_name: cccc\n"
+                    "  short_description: Route work\n"
+                    "  default_prompt: # $cccc only in comment\n"
+                ),
+            )
+            self.assertIn("interface.default_prompt", "\n".join(self.validate(skill_path)))
+
     def test_rejects_other_non_string_plain_scalars(self) -> None:
         invalid_values = (
             "0x10",
