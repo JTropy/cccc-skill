@@ -384,7 +384,7 @@ test_run_dir_is_private() {
 }
 
 test_output_refusal_and_claim() {
-  local tmp claim mode
+  local tmp claim mode identity
   tmp=$(new_test_dir) || return 1
   cccc_refuse_output_target "$tmp/absent.md" || return 1
   printf 'keep\n' >"$tmp/existing.md"
@@ -397,8 +397,83 @@ test_output_refusal_and_claim() {
   mode=$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$claim") || return 1
   assert_eq 700 "$mode" "claim mode" || return 1
   printf 'publish me\n' >"$tmp/source"
-  cccc_atomic_publish "$tmp/source" "$tmp/published.md" || return 1
+  cccc_capture_destination_parent_identity "$tmp/published.md" || return 1
+  identity=$CCCC_DESTINATION_PARENT_IDENTITY
+  case "$identity" in
+    *:*) ;;
+    *) test_diag "invalid destination parent identity: $identity"; return 1 ;;
+  esac
+  cccc_atomic_publish "$tmp/source" "$tmp/published.md" "$identity" || return 1
   assert_eq 'publish me' "$(cat "$tmp/published.md")" "published content"
+}
+
+test_atomic_publish_rejects_replaced_parent_identity() {
+  local tmp parent original outside identity
+  tmp=$(new_test_dir) || return 1
+  parent="$tmp/output"
+  original="$tmp/original-output"
+  outside="$tmp/outside"
+  mkdir "$parent" "$outside" || return 1
+  printf 'payload\n' >"$tmp/source"
+  printf 'keep\n' >"$outside/referent.md"
+  cccc_capture_destination_parent_identity "$parent/result.md" || return 1
+  identity=$CCCC_DESTINATION_PARENT_IDENTITY
+  mv "$parent" "$original" || return 1
+  if ! ln -s "$outside" "$parent" 2>/dev/null; then
+    return 77
+  fi
+  assert_fails cccc_atomic_publish "$tmp/source" "$parent/result.md" "$identity" || return 1
+  [ ! -e "$outside/result.md" ] || return 1
+  assert_eq keep "$(cat "$outside/referent.md")" "outside referent" || return 1
+  [ ! -e "$original/result.md" ]
+}
+
+test_common_python_invocations_ignore_pythonpath() {
+  local tmp attack marker repo before after changed identity
+  tmp=$(new_test_dir) || return 1
+  attack="$tmp/attack"
+  marker="$tmp/pythonpath-loaded"
+  repo="$tmp/repo"
+  mkdir "$attack" || return 1
+  cat >"$attack/sitecustomize.py" <<'PY'
+import os
+from pathlib import Path
+Path(os.environ["CCCC_PYTHONPATH_SENTINEL"]).write_text("loaded")
+PY
+  PYTHONPATH="$attack" CCCC_PYTHONPATH_SENTINEL="$marker" cccc_find_python3 || return 1
+  [ ! -e "$marker" ] || {
+    test_diag 'Python discovery imported PYTHONPATH sitecustomize'
+    return 1
+  }
+
+  printf 'payload\n' >"$tmp/source"
+  PYTHONPATH="$attack" CCCC_PYTHONPATH_SENTINEL="$marker" \
+    cccc_capture_destination_parent_identity "$tmp/result.md" || return 1
+  identity=$CCCC_DESTINATION_PARENT_IDENTITY
+  PYTHONPATH="$attack" CCCC_PYTHONPATH_SENTINEL="$marker" \
+    cccc_atomic_publish "$tmp/source" "$tmp/result.md" "$identity" || return 1
+
+  init_test_repo "$repo" || return 1
+  printf '*.ignored\n' >"$repo/.gitignore"
+  printf 'one\n' >"$repo/file"
+  printf 'ignored\n' >"$repo/cache.ignored"
+  git -C "$repo" add .gitignore file || return 1
+  before="$tmp/before.snapshot"
+  after="$tmp/after.snapshot"
+  changed="$tmp/changed.z"
+  PYTHONPATH="$attack" CCCC_PYTHONPATH_SENTINEL="$marker" \
+    cccc_git_snapshot "$repo" "$before" || return 1
+  printf 'two\n' >"$repo/file"
+  PYTHONPATH="$attack" CCCC_PYTHONPATH_SENTINEL="$marker" \
+    cccc_git_snapshot "$repo" "$after" || return 1
+  PYTHONPATH="$attack" CCCC_PYTHONPATH_SENTINEL="$marker" \
+    cccc_snapshot_changed_paths "$before" "$after" "$changed" || return 1
+  PYTHONPATH="$attack" CCCC_PYTHONPATH_SENTINEL="$marker" \
+    cccc_git_has_ignored_paths "$repo" || return 1
+  [ ! -e "$marker" ] || {
+    test_diag 'a common Python invocation imported PYTHONPATH sitecustomize'
+    return 1
+  }
 }
 
 test_claim_loser_never_owns_winner_claim() {
@@ -888,6 +963,8 @@ run_test "card physical root escape is rejected" test_card_rejects_physical_root
 run_test "card rejects every intermediate symlink" test_card_rejects_every_intermediate_symlink
 run_test "private run directory is mode 700" test_run_dir_is_private
 run_test "existing outputs are refused and claims are atomic" test_output_refusal_and_claim
+run_test "atomic publish pins the captured parent identity" test_atomic_publish_rejects_replaced_parent_identity
+run_test "common Python invocations ignore PYTHONPATH" test_common_python_invocations_ignore_pythonpath
 run_test "claim loser never owns the winner claim" test_claim_loser_never_owns_winner_claim
 run_test "output symlink is refused" test_output_refuses_symlink
 run_test "output FIFO is refused" test_output_refuses_fifo

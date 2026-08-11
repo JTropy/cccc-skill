@@ -27,14 +27,31 @@ class PublishNoClobberTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def run_publish(self, source: Path, destination: Path) -> subprocess.CompletedProcess[str]:
+    def run_publish(
+        self, source: Path, destination: Path, parent_identity: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        arguments = [sys.executable, "-I", str(PUBLISHER)]
+        if parent_identity is not None:
+            arguments.extend(["--parent-identity", parent_identity])
+        arguments.extend([str(source), str(destination)])
         return subprocess.run(
-            [sys.executable, str(PUBLISHER), str(source), str(destination)],
+            arguments,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
         )
+
+    def capture_parent_identity(self, destination: Path) -> str:
+        result = subprocess.run(
+            [sys.executable, "-I", str(PUBLISHER), "--print-parent-identity", str(destination)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        return result.stdout.strip()
 
     def assert_no_temps(self) -> None:
         self.assertEqual([], list(self.root.glob(".cccc-publish-*")))
@@ -73,6 +90,169 @@ class PublishNoClobberTests(unittest.TestCase):
         self.assertEqual(payload, destination.read_bytes())
         self.assertNotEqual(os.stat(source).st_ino, os.stat(destination).st_ino)
         self.assert_no_temps()
+
+    def test_expected_parent_identity_allows_normal_publication(self) -> None:
+        parent = self.root / "output"
+        parent.mkdir()
+        source = self.root / "source"
+        destination = parent / "result.md"
+        source.write_bytes(b"payload")
+        identity = self.capture_parent_identity(destination)
+
+        result = self.run_publish(source, destination, identity)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(b"payload", destination.read_bytes())
+
+    def test_expected_parent_identity_rejects_symlink_replacement(self) -> None:
+        parent = self.root / "output"
+        moved_parent = self.root / "original-output"
+        outside = self.root / "outside"
+        parent.mkdir()
+        outside.mkdir()
+        source = self.root / "source"
+        destination = parent / "result.md"
+        referent = outside / "referent.md"
+        source.write_bytes(b"payload")
+        referent.write_bytes(b"keep")
+        identity = self.capture_parent_identity(destination)
+        parent.rename(moved_parent)
+        try:
+            parent.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"directory symlink unavailable: {error}")
+
+        result = self.run_publish(source, destination, identity)
+
+        self.assertEqual(5, result.returncode, result.stderr)
+        self.assertFalse((outside / destination.name).exists())
+        self.assertEqual(b"keep", referent.read_bytes())
+        self.assertFalse((moved_parent / destination.name).exists())
+
+    def test_expected_parent_identity_rejects_new_directory_at_same_path(self) -> None:
+        parent = self.root / "output"
+        moved_parent = self.root / "original-output"
+        parent.mkdir()
+        source = self.root / "source"
+        destination = parent / "result.md"
+        source.write_bytes(b"payload")
+        identity = self.capture_parent_identity(destination)
+        parent.rename(moved_parent)
+        parent.mkdir()
+
+        result = self.run_publish(source, destination, identity)
+
+        self.assertEqual(5, result.returncode, result.stderr)
+        self.assertFalse(destination.exists())
+        self.assertFalse((moved_parent / destination.name).exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX directory descriptors")
+    def test_parent_swap_after_open_never_publishes_through_external_symlink(self) -> None:
+        module = self.load_module()
+        if not module._supports_pinned_dirfd():
+            self.skipTest("POSIX open/stat/link/unlink dir_fd support unavailable")
+        parent = self.root / "output"
+        moved_parent = self.root / "original-output"
+        outside = self.root / "outside"
+        parent.mkdir()
+        outside.mkdir()
+        source = self.root / "source"
+        destination = parent / "result.md"
+        source.write_bytes(b"payload")
+        identity = self.capture_parent_identity(destination)
+        real_open_source = module._open_verified_source
+        swapped = False
+
+        def open_source_then_swap(path):
+            nonlocal swapped
+            result = real_open_source(path)
+            if not swapped:
+                swapped = True
+                parent.rename(moved_parent)
+                parent.symlink_to(outside, target_is_directory=True)
+            return result
+
+        stderr = StringIO()
+        with redirect_stderr(stderr), mock.patch.object(
+            module, "_open_verified_source", side_effect=open_source_then_swap
+        ):
+            result = module.main(
+                ["--parent-identity", identity, str(source), str(destination)]
+            )
+
+        self.assertIn(result, (0, 5), stderr.getvalue())
+        self.assertFalse((outside / destination.name).exists())
+        self.assertEqual([], list(outside.glob(".cccc-publish-*")))
+        if result == 0:
+            self.assertEqual(b"payload", (moved_parent / destination.name).read_bytes())
+        else:
+            self.assertFalse((moved_parent / destination.name).exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows junction semantics")
+    def test_expected_parent_identity_rejects_windows_junction_replacement(self) -> None:
+        parent = self.root / "output"
+        moved_parent = self.root / "original-output"
+        outside = self.root / "outside"
+        parent.mkdir()
+        outside.mkdir()
+        source = self.root / "source"
+        destination = parent / "result.md"
+        source.write_bytes(b"payload")
+        identity = self.capture_parent_identity(destination)
+        parent.rename(moved_parent)
+        junction = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(parent), str(outside)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if junction.returncode != 0:
+            self.skipTest(f"junction creation unavailable: {junction.stderr or junction.stdout}")
+
+        result = self.run_publish(source, destination, identity)
+
+        self.assertEqual(5, result.returncode, result.stderr)
+        self.assertFalse((outside / destination.name).exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires directory symlink replacement")
+    def test_fallback_cleanup_never_unlinks_same_named_external_file(self) -> None:
+        module = self.load_module()
+        parent = self.root / "output"
+        moved_parent = self.root / "original-output"
+        outside = self.root / "outside"
+        parent.mkdir()
+        outside.mkdir()
+        source = self.root / "source"
+        destination = parent / "result.md"
+        source.write_bytes(b"payload")
+        identity = self.capture_parent_identity(destination)
+        real_mkstemp = module.tempfile.mkstemp
+        temp_name = None
+
+        def create_temp_then_swap(*args, **kwargs):
+            nonlocal temp_name
+            descriptor, raw_path = real_mkstemp(*args, **kwargs)
+            temp_name = Path(raw_path).name
+            parent.rename(moved_parent)
+            parent.symlink_to(outside, target_is_directory=True)
+            (outside / temp_name).write_bytes(b"keep")
+            return descriptor, raw_path
+
+        stderr = StringIO()
+        with redirect_stderr(stderr), mock.patch.object(
+            module, "_PINNED_DIRFD_SUPPORTED", False
+        ), mock.patch.object(module.tempfile, "mkstemp", side_effect=create_temp_then_swap):
+            result = module.main(
+                ["--parent-identity", identity, str(source), str(destination)]
+            )
+
+        self.assertEqual(5, result, stderr.getvalue())
+        self.assertIsNotNone(temp_name)
+        assert temp_name is not None
+        self.assertEqual(b"keep", (outside / temp_name).read_bytes())
+        self.assertTrue((moved_parent / temp_name).exists())
+        self.assertIn("warning", stderr.getvalue().lower())
 
     def test_existing_regular_destination_is_never_changed(self) -> None:
         source = self.root / "source"
@@ -233,15 +413,15 @@ class PublishNoClobberTests(unittest.TestCase):
         source = self.root / "source"
         destination = self.root / "destination"
         source.write_bytes(b"payload")
-        real_unlink = module.Path.unlink
+        real_unlink = module.os.unlink
 
         def fail_owned_temp(path, *args, **kwargs):
-            if path.name.startswith(".cccc-publish-"):
+            if Path(path).name.startswith(".cccc-publish-"):
                 raise PermissionError(errno.EACCES, "simulated cleanup denial")
             return real_unlink(path, *args, **kwargs)
 
         stderr = StringIO()
-        with redirect_stderr(stderr), mock.patch.object(module.Path, "unlink", fail_owned_temp):
+        with redirect_stderr(stderr), mock.patch.object(module.os, "unlink", fail_owned_temp):
             result = module.main([str(source), str(destination)])
 
         self.assertEqual(0, result, stderr.getvalue())
@@ -381,17 +561,17 @@ class PublishNoClobberTests(unittest.TestCase):
         source = self.root / "source"
         destination = self.root / "destination"
         source.write_bytes(b"payload")
-        real_unlink = module.Path.unlink
+        real_unlink = module.os.unlink
 
         def fail_owned_temp(path, *args, **kwargs):
-            if path.name.startswith(".cccc-publish-"):
+            if Path(path).name.startswith(".cccc-publish-"):
                 raise PermissionError(errno.EACCES, "simulated cleanup denial")
             return real_unlink(path, *args, **kwargs)
 
         stderr = StringIO()
         with redirect_stderr(stderr), mock.patch.object(
             module.os, "link", side_effect=OSError(errno.EXDEV, "simulated link failure")
-        ), mock.patch.object(module.Path, "unlink", fail_owned_temp):
+        ), mock.patch.object(module.os, "unlink", fail_owned_temp):
             result = module.main([str(source), str(destination)])
 
         self.assertEqual(5, result)

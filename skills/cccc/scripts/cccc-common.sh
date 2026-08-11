@@ -55,7 +55,7 @@ cccc_find_python3() {
   CCCC_PYTHON=
   for candidate in python3 python; do
     path=$(type -P "$candidate" 2>/dev/null || true)
-    if [ -n "$path" ] && "$path" -c 'import sys; raise SystemExit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+    if [ -n "$path" ] && "$path" -I -c 'import sys; raise SystemExit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
       CCCC_PYTHON=$path
       return 0
     fi
@@ -370,13 +370,43 @@ cccc_acquire_claim() {
 }
 
 cccc_atomic_publish() {
-  local source=${1-} destination=${2-}
-  if [ -z "$source" ] || [ -z "$destination" ]; then
+  local source=${1-} destination=${2-} parent_identity=${3-}
+  if [ -z "$source" ] || [ -z "$destination" ] || [ "$#" -gt 3 ]; then
     cccc_die 'atomic publish requires source and destination'
     return 1
   fi
   cccc_find_python3 || return 1
-  "$CCCC_PYTHON" "$CCCC_COMMON_DIR/publish-no-clobber.py" "$source" "$destination"
+  if [ "$#" -eq 3 ]; then
+    [ -n "$parent_identity" ] || {
+      cccc_die 'destination parent identity must not be empty'
+      return 1
+    }
+    "$CCCC_PYTHON" -I "$CCCC_COMMON_DIR/publish-no-clobber.py" \
+      --parent-identity "$parent_identity" "$source" "$destination"
+    return $?
+  fi
+  "$CCCC_PYTHON" -I "$CCCC_COMMON_DIR/publish-no-clobber.py" "$source" "$destination"
+}
+
+cccc_capture_destination_parent_identity() {
+  local destination=${1-} identity
+  CCCC_DESTINATION_PARENT_IDENTITY=
+  if [ -z "$destination" ] || [ "$#" -ne 1 ]; then
+    cccc_die 'destination parent identity capture requires one destination'
+    return 1
+  fi
+  cccc_find_python3 || return 1
+  identity=$("$CCCC_PYTHON" -I "$CCCC_COMMON_DIR/publish-no-clobber.py" \
+    --print-parent-identity "$destination") || return $?
+  case "$identity" in
+    *:*) ;;
+    *)
+      cccc_die 'publisher returned an invalid destination parent identity'
+      return 5
+      ;;
+  esac
+  CCCC_DESTINATION_PARENT_IDENTITY=$identity
+  return 0
 }
 
 cccc_git_head() {
@@ -400,7 +430,7 @@ cccc_git_snapshot() {
     return 1
   }
   cccc_find_python3 || return 1
-  "$CCCC_PYTHON" - "$repo" "$output" <<'PY'
+  "$CCCC_PYTHON" -I - "$repo" "$output" <<'PY'
 import hashlib
 import os
 import stat
@@ -560,7 +590,7 @@ cccc_snapshot_changed_paths() {
     return 1
   }
   cccc_find_python3 || return 1
-  "$CCCC_PYTHON" - "$before" "$after" "$output" <<'PY'
+  "$CCCC_PYTHON" -I - "$before" "$after" "$output" <<'PY'
 import os
 import sys
 
@@ -606,7 +636,7 @@ cccc_git_has_ignored_paths() {
   local repo=${1:-${CCCC_REPO_ROOT-}}
   [ -n "$repo" ] || return 1
   cccc_find_python3 || return 1
-  "$CCCC_PYTHON" - "$repo" <<'PY'
+  "$CCCC_PYTHON" -I - "$repo" <<'PY'
 import subprocess
 import sys
 
