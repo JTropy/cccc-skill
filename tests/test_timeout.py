@@ -220,41 +220,87 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
             RUNNER_MODULE.run(["1", "--", "child"])
         self.assertIs(signal.getsignal(signal.SIGTERM), previous)
 
-    def test_windows_launch_is_suspended_before_job_assignment(self):
+    def test_windows_bootstrap_assigns_job_before_releasing_gate(self):
         process = mock.Mock()
-        process.wait.return_value = 0
+        gate = mock.Mock(name="gate")
+        gate.name = "Local\\cccc-test-gate"
         job = mock.Mock()
-        job.close.return_value = None
-        launches = []
+        events = []
 
-        def launch(_command, **options):
-            launches.append(options)
+        def launch(arguments, **options):
+            events.append("popen")
+            self.assertEqual(options["creationflags"], 0x00000200)
+            self.assertEqual(arguments[-3:], ["--", "target", "argument"])
             return process
 
-        with mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
+        def assign(_process):
+            events.append("assign")
+            return job, None
+
+        gate.set.side_effect = lambda: events.append("set") or None
+        with mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
              mock.patch.object(
                  RUNNER_MODULE.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
              ), \
              mock.patch.object(RUNNER_MODULE.subprocess, "Popen", side_effect=launch), \
-             mock.patch.object(RUNNER_MODULE, "create_windows_job", return_value=(job, None)):
-            status = RUNNER_MODULE.run(["0", "--", "child"])
+             mock.patch.object(RUNNER_MODULE, "create_windows_job", side_effect=assign):
+            bootstrap, created_gate, assigned_job, error = RUNNER_MODULE.launch_windows_bootstrap(
+                ["target", "argument"]
+            )
+
+        self.assertIs(bootstrap, process)
+        self.assertIs(created_gate, gate)
+        self.assertIs(assigned_job, job)
+        self.assertIsNone(error)
+        self.assertEqual(events, ["popen", "assign", "set"])
+
+    def test_windows_assignment_failure_never_releases_gate(self):
+        process = mock.Mock()
+        gate = mock.Mock()
+        gate.name = "Local\\cccc-test-gate"
+        with mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
+             mock.patch.object(
+                 RUNNER_MODULE.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
+             ), \
+             mock.patch.object(RUNNER_MODULE.subprocess, "Popen", return_value=process), \
+             mock.patch.object(
+                 RUNNER_MODULE, "create_windows_job", return_value=(None, "assignment failed")
+             ):
+            _bootstrap, _gate, _job, error = RUNNER_MODULE.launch_windows_bootstrap(["target"])
+
+        self.assertIn("assignment failed", error)
+        gate.set.assert_not_called()
+
+    def test_windows_bootstrap_parent_death_does_not_start_target(self):
+        with mock.patch.object(RUNNER_MODULE, "wait_for_windows_bootstrap_gate", return_value="parent"), \
+             mock.patch.object(RUNNER_MODULE.subprocess, "Popen") as launch:
+            status = RUNNER_MODULE.run_windows_bootstrap("gate", 123, ["target"])
 
         self.assertEqual(status, 0)
-        self.assertTrue(launches[0]["creationflags"] & 0x00000004)
+        launch.assert_not_called()
 
-    def test_windows_assignment_failure_never_resumes_suspended_target(self):
+    def test_windows_bootstrap_parent_wait_closes_both_handles(self):
+        kernel32 = mock.Mock()
+        kernel32.OpenEventW.return_value = 10
+        kernel32.OpenProcess.return_value = 20
+        kernel32.WaitForMultipleObjects.return_value = 1  # parent is second handle
+        kernel32.CloseHandle.return_value = True
+        with mock.patch.object(ctypes, "WinDLL", return_value=kernel32, create=True):
+            result = RUNNER_MODULE.wait_for_windows_bootstrap_gate("gate", 123)
+
+        self.assertEqual(result, "parent")
+        self.assertEqual(kernel32.CloseHandle.call_args_list, [mock.call(20), mock.call(10)])
+
+    def test_windows_bootstrap_passes_original_command_without_stdio_overrides(self):
         process = mock.Mock()
-        job = mock.Mock()
-        job.assign.side_effect = OSError("assignment denied")
-        with mock.patch.object(RUNNER_MODULE, "WindowsJob", return_value=job), \
-             mock.patch.object(RUNNER_MODULE, "stop_windows", return_value=None) as stop, \
-             mock.patch.object(RUNNER_MODULE, "resume_windows_process") as resume:
-            assigned_job, error = RUNNER_MODULE.create_windows_job(process)
+        process.wait.return_value = 37
+        command = ["target", "argument with spaces"]
+        with mock.patch.object(RUNNER_MODULE, "wait_for_windows_bootstrap_gate", return_value="gate"), \
+             mock.patch.object(RUNNER_MODULE.subprocess, "Popen", return_value=process) as launch:
+            status = RUNNER_MODULE.run_windows_bootstrap("gate", 123, command)
 
-        self.assertIsNone(assigned_job)
-        self.assertIn("assignment failed", error)
-        resume.assert_not_called()
-        stop.assert_called_once_with(process, job)
+        self.assertEqual(status, 37)
+        launch.assert_called_once_with(command)
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
     def test_posix_grace_sleep_never_passes_deadline(self):

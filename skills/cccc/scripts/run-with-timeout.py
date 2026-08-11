@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 
 
 USAGE = "usage: run-with-timeout.py SECONDS -- COMMAND [ARG ...]"
@@ -13,7 +14,7 @@ CLEANUP_GRACE_SECONDS = 2
 POLL_INTERVAL_SECONDS = 0.05
 # Keep the timeout safely representable as milliseconds on every supported platform.
 MAX_TIMEOUT_SECONDS = min(sys.maxsize // 1000, (2**31 - 1) // 1000)
-WINDOWS_CREATE_SUSPENDED = 0x00000004
+WINDOWS_BOOTSTRAP_WAIT_MS = 10_000
 
 
 class RunnerInterrupted(Exception):
@@ -202,6 +203,42 @@ class WindowsJob:
         return None
 
 
+class WindowsGate:
+    """A private named event that prevents bootstrap from launching the target early."""
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+
+        self._ctypes = ctypes
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel32.CreateEventW.argtypes = [
+            ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR,
+        ]
+        self._kernel32.CreateEventW.restype = wintypes.HANDLE
+        self._kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+        self._kernel32.SetEvent.restype = wintypes.BOOL
+        self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._kernel32.CloseHandle.restype = wintypes.BOOL
+        self.name = f"Local\\cccc-timeout-{os.getpid()}-{uuid.uuid4().hex}"
+        self.handle = self._kernel32.CreateEventW(None, True, False, self.name)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def set(self):
+        if not self._kernel32.SetEvent(self.handle):
+            return f"could not release Windows bootstrap gate: {self._ctypes.WinError(self._ctypes.get_last_error())}"
+        return None
+
+    def close(self):
+        if not self.handle:
+            return None
+        handle, self.handle = self.handle, None
+        if not self._kernel32.CloseHandle(handle):
+            return f"could not close Windows bootstrap gate: {self._ctypes.WinError(self._ctypes.get_last_error())}"
+        return None
+
+
 def stop_windows(process, job=None):
     errors = []
     try:
@@ -226,19 +263,6 @@ def stop_windows(process, job=None):
         if close_error:
             errors.append(close_error)
     return join_cleanup_errors(*errors) or None
-
-
-def resume_windows_process(process):
-    """Release a CREATE_SUSPENDED process only after it belongs to the Job Object."""
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
-    kernel32.ResumeThread.restype = wintypes.DWORD
-    if kernel32.ResumeThread(process._thread) == 0xFFFFFFFF:
-        return f"could not resume suspended process: {ctypes.WinError(ctypes.get_last_error())}"
-    return None
 
 
 def install_interrupt_handlers():
@@ -278,16 +302,108 @@ def create_windows_job(process):
     try:
         job = WindowsJob()
         job.assign(process)
-        resume_error = resume_windows_process(process)
-        if not resume_error:
-            return job, None
-        cleanup_error = stop_windows(process, job)
-        return None, join_cleanup_errors(resume_error, cleanup_error)
+        return job, None
     except OSError as exc:
         cleanup_error = stop_windows(process, job)
         return None, join_cleanup_errors(
             f"Windows Job Object assignment failed: {exc}", cleanup_error
         )
+
+
+def launch_windows_bootstrap(command):
+    """Start a gated bootstrap, assign it to a Job, then release its target command."""
+    try:
+        gate = WindowsGate()
+    except OSError as exc:
+        return None, None, None, f"could not create Windows bootstrap gate: {exc}"
+    bootstrap_command = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--windows-bootstrap",
+        gate.name,
+        str(os.getpid()),
+        "--",
+        *command,
+    ]
+    try:
+        process = subprocess.Popen(
+            bootstrap_command,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+    except OSError as exc:
+        close_error = gate.close()
+        return None, gate, None, join_cleanup_errors(
+            f"could not start Windows bootstrap: {exc}", close_error
+        )
+    job, error = create_windows_job(process)
+    if error:
+        return process, gate, None, error
+    release_error = gate.set()
+    if release_error:
+        cleanup_error = stop_windows(process, job)
+        return process, gate, None, join_cleanup_errors(release_error, cleanup_error)
+    return process, gate, job, None
+
+
+def wait_for_windows_bootstrap_gate(event_name, parent_pid):
+    """Return gate, parent, or an error after waiting on the immutable parent handle."""
+    import ctypes
+    from ctypes import wintypes
+
+    synchronize = 0x00100000
+    wait_object_0 = 0
+    wait_timeout = 0x00000102
+    wait_failed = 0xFFFFFFFF
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.OpenEventW.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForMultipleObjects.argtypes = [
+        wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE), wintypes.BOOL, wintypes.DWORD,
+    ]
+    kernel32.WaitForMultipleObjects.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    event = kernel32.OpenEventW(synchronize, False, event_name)
+    if not event:
+        return f"could not open Windows bootstrap gate: {ctypes.WinError(ctypes.get_last_error())}"
+    parent = kernel32.OpenProcess(synchronize, False, parent_pid)
+    if not parent:
+        kernel32.CloseHandle(event)
+        return "parent"
+    try:
+        handles = (wintypes.HANDLE * 2)(event, parent)
+        result = kernel32.WaitForMultipleObjects(
+            2, handles, False, WINDOWS_BOOTSTRAP_WAIT_MS
+        )
+        if result == wait_object_0:
+            return "gate"
+        if result == wait_object_0 + 1:
+            return "parent"
+        if result == wait_timeout:
+            return "bootstrap gate wait timed out"
+        if result == wait_failed:
+            return f"bootstrap gate wait failed: {ctypes.WinError(ctypes.get_last_error())}"
+        return f"bootstrap gate wait returned {result}"
+    finally:
+        kernel32.CloseHandle(parent)
+        kernel32.CloseHandle(event)
+
+
+def run_windows_bootstrap(event_name, parent_pid, command):
+    wait_result = wait_for_windows_bootstrap_gate(event_name, parent_pid)
+    if wait_result == "parent":
+        return 0
+    if wait_result != "gate":
+        print(f"cccc-timeout: bootstrap {wait_result}", file=sys.stderr)
+        return 127
+    try:
+        return subprocess.Popen(command).wait()
+    except OSError as exc:
+        print(f"cccc-timeout: bootstrap cannot start command: {exc}", file=sys.stderr)
+        return 127
 
 
 def run(argv):
@@ -298,31 +414,28 @@ def run(argv):
     options = {}
     if os.name == "posix":
         options["start_new_session"] = True
-    elif os.name == "nt":
-        # Assign while suspended so the command cannot spawn descendants before joining the Job.
-        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | WINDOWS_CREATE_SUSPENDED
 
     interrupt_state = None
     previous_handlers = None
     job = None
+    gate = None
     result = None
     process = None
     if os.name == "posix":
         interrupt_state, previous_handlers = install_interrupt_handlers()
     try:
         try:
-            process = subprocess.Popen(command, **options)
+            if os.name == "nt":
+                process, gate, job, error = launch_windows_bootstrap(command)
+                if error:
+                    result = cleanup_failed(error)
+            else:
+                process = subprocess.Popen(command, **options)
             if interrupt_state is not None:
                 interrupt_state.process = process
                 if interrupt_state.signum is not None:
                     raise RunnerInterrupted(interrupt_state.signum)
-            if os.name == "nt":
-                job, error = create_windows_job(process)
-                if error:
-                    result = cleanup_failed(error)
-                else:
-                    result = process.wait() if seconds == 0 else process.wait(timeout=seconds)
-            else:
+            if result is None:
                 result = process.wait() if seconds == 0 else process.wait(timeout=seconds)
             if interrupt_state is not None:
                 interrupt_state.process = None
@@ -369,11 +482,31 @@ def run(argv):
             close_error = job.close()
             if close_error:
                 result = cleanup_failed(close_error)
+        if gate is not None:
+            close_error = gate.close()
+            if close_error:
+                result = cleanup_failed(close_error)
     return result
 
 
 def main():
+    if len(sys.argv) >= 5 and sys.argv[1] == "--windows-bootstrap":
+        if os.name != "nt" or sys.argv[4] != "--" or len(sys.argv) < 6:
+            print("cccc-timeout: invalid Windows bootstrap invocation", file=sys.stderr)
+            return 127
+        try:
+            parent_pid = int(sys.argv[3])
+        except ValueError:
+            print("cccc-timeout: invalid Windows bootstrap parent pid", file=sys.stderr)
+            return 127
+        return exit_with_signal_semantics(
+            run_windows_bootstrap(sys.argv[2], parent_pid, sys.argv[5:])
+        )
     status = run(sys.argv[1:])
+    return exit_with_signal_semantics(status)
+
+
+def exit_with_signal_semantics(status):
     if status < 0 and os.name == "posix":
         signum = -status
         try:
