@@ -2534,7 +2534,15 @@ for argument in "$@"; do
 done
 if [ -n "$status_file" ]; then
   if [ -n "$token_file" ]; then
-    "$CCCC_REAL_PYTHON" -I "$CCCC_AUTH_STATUS_HELPER" \
+    auth_helper=$CCCC_AUTH_STATUS_HELPER
+    case ${MSYSTEM-} in
+      MINGW*|MSYS*|UCRT*)
+        auth_helper=$(cygpath -w "$auth_helper") || exit 125
+        token_file=$(cygpath -w "$token_file") || exit 125
+        status_file=$(cygpath -w "$status_file") || exit 125
+        ;;
+    esac
+    "$CCCC_REAL_PYTHON" -I "$auth_helper" \
       "$token_file" "$status_file" child-exit 4294967295 || exit 125
   else
     printf '%s\n' \
