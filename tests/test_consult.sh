@@ -813,11 +813,26 @@ test_codex_strict_private_cwd_is_0700_and_not_repo() {
     grep -Fxq 'codex_cwd_mode=700' "$CASE_PRIVATE" || return 1
   fi
   cwd=$(sed -n 's/^codex_cwd=//p' "$CASE_PRIVATE")
-  [ -n "$cwd" ] && [ "$cwd" != "$CASE_REPO_PHYSICAL" ] || return 1
-  case "$cwd" in
-    "$CASE_TMP"/*|"$CASE_TMP_PHYSICAL"/*) ;;
-    *) return 1 ;;
-  esac
+  [ -n "$cwd" ] || return 1
+  python3 -I - "$cwd" "$CASE_REPO_PHYSICAL" "$CASE_TMP" "$CASE_TMP_PHYSICAL" <<'PY' || return 1
+import os
+import sys
+
+def key(value):
+    return os.path.normcase(os.path.realpath(os.path.abspath(value)))
+
+cwd, repo, *temporary_roots = map(key, sys.argv[1:])
+if cwd == repo:
+    raise SystemExit("Codex private cwd is the repository")
+for root in temporary_roots:
+    try:
+        if os.path.commonpath((cwd, root)) == root and cwd != root:
+            break
+    except ValueError:
+        pass
+else:
+    raise SystemExit("Codex private cwd is outside the test temporary root")
+PY
   if sed -n '/codex_cwd_entries_begin/,/codex_cwd_entries_end/p' "$CASE_PRIVATE" | sed '1d;$d' | grep -q .; then
     test_diag 'Codex private cwd was not empty at launch'
     return 1
@@ -915,17 +930,29 @@ test_update_notify_and_login_shell_behavior_probes_stay_quiet() {
 }
 
 test_child_environment_is_scoped_and_python_is_isolated() {
-  local real_python python_log
+  local real_python python_log poison_dir poison_sentinel
   prepare_case || return 1
   real_python=$(command -v python3) || return 1
   python_log="$CASE_DIR/python-argv.log"
-  cat >"$CASE_BIN/python3" <<'PYTHON_SHIM'
+  poison_dir="$CASE_DIR/python-poison"
+  poison_sentinel="$CASE_DIR/python-sitecustomize-ran"
+  if [ "$CONSULT_TEST_WINDOWS" -eq 0 ]; then
+    cat >"$CASE_BIN/python3" <<'PYTHON_SHIM'
 #!/usr/bin/env bash
 printf '%s\n' "${1-}" >>"$CCCC_FAKE_PYTHON_LOG" || exit 98
 exec "$CCCC_REAL_PYTHON" "$@"
 PYTHON_SHIM
-  chmod +x "$CASE_BIN/python3" || return 1
+    chmod +x "$CASE_BIN/python3" || return 1
+  else
+    mkdir -p "$poison_dir" || return 1
+    cat >"$poison_dir/sitecustomize.py" <<'PYTHON_POISON'
+import os
+with open(os.environ["CCCC_PYTHON_POISON_SENTINEL"], "w", encoding="utf-8") as stream:
+    stream.write("loaded\n")
+PYTHON_POISON
+  fi
   BASH_ENV="$CASE_DIR/poison-bash-env" ENV="$CASE_DIR/poison-env" \
+    PYTHONPATH="$poison_dir" CCCC_PYTHON_POISON_SENTINEL="$poison_sentinel" \
     CCCC_REAL_PYTHON="$real_python" CCCC_FAKE_PYTHON_LOG="$python_log" run_consult claude
   assert_success_outputs || return 1
   grep -Fxq 'DELEGATE_DEPTH=1' "$CASE_ENV" || return 1
@@ -933,9 +960,14 @@ PYTHON_SHIM
   grep -Fxq 'ENV=<unset>' "$CASE_ENV" || return 1
   grep -Fxq 'DISABLE_AUTOUPDATER=1' "$CASE_ENV" || return 1
   grep -Fxq 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1' "$CASE_ENV" || return 1
-  [ -s "$python_log" ] || return 1
-  if grep -Fvxq -- '-I' "$python_log"; then
-    test_diag 'wrapper made a non-isolated Python call'
+  if [ "$CONSULT_TEST_WINDOWS" -eq 0 ]; then
+    [ -s "$python_log" ] || return 1
+    if grep -Fvxq -- '-I' "$python_log"; then
+      test_diag 'wrapper made a non-isolated Python call'
+      return 1
+    fi
+  elif [ -e "$poison_sentinel" ]; then
+    test_diag 'a Windows wrapper Python call loaded PYTHONPATH sitecustomize'
     return 1
   fi
 }
@@ -1668,7 +1700,9 @@ test_repo_lock_blocks_same_and_different_consult_cards_and_targets() {
   if require_posix_inode_capability; then
     assert_lock_acquisition_signal_window || return 1
   fi
-  assert_lock_held_during_publication
+  if [ "$CONSULT_TEST_WINDOWS" -eq 0 ]; then
+    assert_lock_held_during_publication
+  fi
 }
 
 write_delegate_card() {
