@@ -301,6 +301,21 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         self.assertEqual(status, 127)
         gate.close.assert_called_once_with()
 
+    def test_windows_bootstrap_popen_failure_with_gate_close_failure_is_125(self):
+        gate = mock.Mock()
+        gate.name = "Local\\cccc-test-gate"
+        gate.close.return_value = "could not close Windows bootstrap gate"
+        with mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
+             mock.patch.object(
+                 RUNNER_MODULE.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
+             ), \
+             mock.patch.object(RUNNER_MODULE.subprocess, "Popen", side_effect=OSError("launch failed")):
+            _bootstrap, _gate, _job, error, status = RUNNER_MODULE.launch_windows_bootstrap(["target"])
+
+        self.assertIn("could not close Windows bootstrap gate", error)
+        self.assertEqual(status, 125)
+        gate.close.assert_called_once_with()
+
     def test_windows_assignment_cleanup_failure_is_125(self):
         process = mock.Mock()
         gate = mock.Mock()

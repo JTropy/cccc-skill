@@ -329,8 +329,10 @@ def launch_windows_bootstrap(command):
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
     except OSError as exc:
-        gate.close()
-        return None, gate, None, f"could not start Windows bootstrap: {exc}", 127
+        close_error = gate.close()
+        return None, gate, None, join_cleanup_errors(
+            f"could not start Windows bootstrap: {exc}", close_error
+        ), (125 if close_error else 127)
     job, setup_error, cleanup_error = create_windows_job(process)
     if setup_error:
         cleanup_error = join_cleanup_errors(cleanup_error, gate.close())
