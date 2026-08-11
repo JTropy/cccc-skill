@@ -3,6 +3,7 @@
 
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -92,6 +93,29 @@ def join_cleanup_errors(*errors):
     return "; ".join(error for error in errors if error)
 
 
+def confirm_posix_post_kill(process, process_group):
+    """Boundedly prove both the direct child and its process group are gone."""
+    deadline = time.monotonic() + CLEANUP_GRACE_SECONDS
+    direct_process_gone = False
+    process_group_gone = False
+    while True:
+        direct_process_gone = process.poll() is not None
+        process_group_gone = not process_group_exists(process_group)
+        if direct_process_gone and process_group_gone:
+            return None
+        remaining = max(0, deadline - time.monotonic())
+        if remaining == 0:
+            break
+        time.sleep(min(POLL_INTERVAL_SECONDS, remaining))
+
+    errors = []
+    if not direct_process_gone:
+        errors.append("direct process did not exit after SIGKILL")
+    if not process_group_gone:
+        errors.append("process group still exists after SIGKILL")
+    return join_cleanup_errors(*errors)
+
+
 def stop_posix(process):
     process_group = process.pid
     try:
@@ -119,7 +143,7 @@ def stop_posix(process):
         return bounded_reap(process)
     except OSError as exc:
         return join_cleanup_errors(f"SIGKILL failed: {exc}", bounded_reap(process))
-    return bounded_reap(process)
+    return confirm_posix_post_kill(process, process_group)
 
 
 class WindowsJob:
@@ -187,7 +211,9 @@ class WindowsJob:
             ctypes.sizeof(information),
         ):
             error = ctypes.WinError(ctypes.get_last_error())
-            self.close()
+            close_error = self.close()
+            if close_error:
+                error.cleanup_error = close_error
             raise error
 
     def assign(self, process):
@@ -304,12 +330,32 @@ def create_windows_job(process):
         job.assign(process)
         return job, None, None
     except OSError as exc:
-        cleanup_error = stop_windows(process, job)
+        cleanup_error = join_cleanup_errors(
+            getattr(exc, "cleanup_error", None), stop_windows(process, job)
+        )
         return None, f"Windows Job Object assignment failed: {exc}", cleanup_error
+
+
+def resolve_windows_command(command):
+    """Resolve a native Windows executable without invoking command-shell scripts."""
+    resolved = shutil.which(command[0])
+    if resolved is None:
+        return None, f"Windows command not found: {command[0]}"
+    extension = os.path.splitext(resolved)[1].lower()
+    if extension not in (".exe", ".com"):
+        return None, (
+            f"Windows command {resolved} is not a native executable; "
+            "use an explicit interpreter"
+        )
+    return [resolved, *command[1:]], None
 
 
 def launch_windows_bootstrap(command):
     """Start a gated bootstrap, assign it to a Job, then release its target command."""
+    if os.name == "nt":
+        command, resolution_error = resolve_windows_command(command)
+        if resolution_error:
+            return None, None, None, resolution_error, 127
     try:
         gate = WindowsGate()
     except OSError as exc:

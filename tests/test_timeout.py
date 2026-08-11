@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import signal
+import shutil
 import io
 import ctypes
 import subprocess
@@ -255,6 +256,56 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         self.assertIsNone(status)
         self.assertEqual(events, ["popen", "assign", "set"])
 
+    def test_windows_cmd_resolution_fails_without_starting_bootstrap(self):
+        gate = mock.Mock()
+        gate.name = "Local\\cccc-test-gate"
+        gate.set.return_value = None
+        job = mock.Mock()
+        with mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
+             mock.patch.object(shutil, "which", return_value=r"C:\\Tools\\codex.cmd"), \
+             mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate) as create_gate, \
+             mock.patch.object(
+                 RUNNER_MODULE.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
+             ), \
+             mock.patch.object(RUNNER_MODULE.subprocess, "Popen", return_value=mock.Mock()) as launch, \
+             mock.patch.object(RUNNER_MODULE, "create_windows_job", return_value=(job, None, None)):
+            _bootstrap, _gate, _job, error, status = RUNNER_MODULE.launch_windows_bootstrap(
+                ["codex", "prompt"]
+            )
+
+        self.assertEqual(status, 127)
+        self.assertIn("explicit interpreter", error)
+        create_gate.assert_not_called()
+        launch.assert_not_called()
+
+    def test_windows_native_resolution_preserves_argument_boundaries(self):
+        process = mock.Mock()
+        gate = mock.Mock()
+        gate.name = "Local\\cccc-test-gate"
+        gate.set.return_value = None
+        job = mock.Mock()
+        resolved = r"C:\\Tools\\codex.exe"
+        original_arguments = ["argument with spaces", "& whoami", "$(unsafe)"]
+
+        def launch(arguments, **_options):
+            self.assertEqual(arguments[-5:], ["--", resolved, *original_arguments])
+            return process
+
+        with mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
+             mock.patch.object(shutil, "which", return_value=resolved), \
+             mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
+             mock.patch.object(
+                 RUNNER_MODULE.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
+             ), \
+             mock.patch.object(RUNNER_MODULE.subprocess, "Popen", side_effect=launch), \
+             mock.patch.object(RUNNER_MODULE, "create_windows_job", return_value=(job, None, None)):
+            _bootstrap, _gate, _job, error, status = RUNNER_MODULE.launch_windows_bootstrap(
+                ["codex", *original_arguments]
+            )
+
+        self.assertIsNone(error)
+        self.assertIsNone(status)
+
     def test_windows_assignment_failure_never_releases_gate(self):
         process = mock.Mock()
         gate = mock.Mock()
@@ -337,6 +388,37 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         self.assertEqual(status, 125)
         gate.set.assert_not_called()
 
+    def test_windows_job_setup_records_handle_close_failure(self):
+        kernel32 = mock.Mock()
+        kernel32.CreateJobObjectW.return_value = 10
+        kernel32.SetInformationJobObject.return_value = False
+        kernel32.CloseHandle.return_value = False
+        windows_errors = iter([OSError("set information failed"), OSError("close failed")])
+        with mock.patch.object(ctypes, "WinDLL", return_value=kernel32, create=True), \
+             mock.patch.object(
+                 ctypes,
+                 "WinError",
+                 side_effect=lambda *_args: next(windows_errors),
+                 create=True,
+             ), \
+             mock.patch.object(ctypes, "get_last_error", return_value=5, create=True):
+            with self.assertRaises(OSError) as raised:
+                RUNNER_MODULE.WindowsJob()
+
+        self.assertIn("close failed", raised.exception.cleanup_error)
+
+    def test_windows_job_setup_close_failure_propagates_as_cleanup_error(self):
+        process = mock.Mock()
+        failure = OSError("job setup failed")
+        failure.cleanup_error = "could not close Windows Job Object"
+        with mock.patch.object(RUNNER_MODULE, "WindowsJob", side_effect=failure), \
+             mock.patch.object(RUNNER_MODULE, "stop_windows", return_value=None):
+            job, setup_error, cleanup_error = RUNNER_MODULE.create_windows_job(process)
+
+        self.assertIsNone(job)
+        self.assertIn("job setup failed", setup_error)
+        self.assertIn("could not close Windows Job Object", cleanup_error)
+
     def test_windows_run_uses_explicit_bootstrap_setup_status(self):
         stderr = io.StringIO()
         with mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
@@ -402,9 +484,12 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
     def test_posix_grace_sleep_never_passes_deadline(self):
         process = mock.Mock()
+        process.poll.return_value = 0
         with mock.patch.object(RUNNER_MODULE, "process_group_exists", return_value=True), \
              mock.patch.object(RUNNER_MODULE.os, "killpg") as killpg, \
-             mock.patch.object(RUNNER_MODULE.time, "monotonic", side_effect=[10, 11.99, 12]), \
+             mock.patch.object(
+                 RUNNER_MODULE.time, "monotonic", side_effect=[10, 11.99, 12, 20, 22]
+             ), \
              mock.patch.object(RUNNER_MODULE.time, "sleep") as sleep:
             RUNNER_MODULE.stop_posix(process)
 
@@ -414,7 +499,7 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
             [call.args[1] for call in killpg.call_args_list],
             [RUNNER_MODULE.signal.SIGTERM, RUNNER_MODULE.signal.SIGKILL],
         )
-        process.wait.assert_called_once_with(timeout=2)
+        process.wait.assert_not_called()
 
     def test_windows_timeout_kills_after_terminate_grace_expires(self):
         process = mock.Mock()
@@ -480,14 +565,32 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
     def test_posix_non_reap_after_kill_returns_cleanup_failure(self):
         process = mock.Mock()
-        process.wait.side_effect = subprocess.TimeoutExpired(["child"], 2)
+        process.poll.return_value = None
         with mock.patch.object(RUNNER_MODULE, "process_group_exists", return_value=True), \
              mock.patch.object(RUNNER_MODULE.os, "killpg"), \
-             mock.patch.object(RUNNER_MODULE.time, "monotonic", side_effect=[0, 2]):
+             mock.patch.object(
+                 RUNNER_MODULE.time, "monotonic", side_effect=[0, 2, 10, 12]
+             ):
             error = RUNNER_MODULE.stop_posix(process)
 
         self.assertIn("did not exit", error)
-        process.wait.assert_called_once_with(timeout=2)
+        self.assertIn("process group", error)
+        process.wait.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_posix_reaped_child_with_surviving_group_is_cleanup_failure(self):
+        process = mock.Mock()
+        process.poll.return_value = 0
+        with mock.patch.object(RUNNER_MODULE, "process_group_exists", return_value=True), \
+             mock.patch.object(RUNNER_MODULE.os, "killpg"), \
+             mock.patch.object(
+                 RUNNER_MODULE.time, "monotonic", side_effect=[0, 2, 10, 12]
+            ):
+            error = RUNNER_MODULE.stop_posix(process)
+
+        self.assertIsNotNone(error)
+        self.assertIn("process group", error)
+        self.assertNotIn("direct process", error)
 
 
 @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
