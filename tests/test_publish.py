@@ -640,10 +640,13 @@ class PublishNoClobberTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(destination))
         if moved.exists():
             self.assertEqual(b"original", moved.read_bytes())
+        elif os.name == "nt":
+            # Windows denies renaming this opened source, so the attempted
+            # replacement fails before it can change the original path.
+            self.assertEqual(b"original", source.read_bytes())
         else:
-            # Windows may keep the opened source path bound while the callback
-            # replaces its contents; the security property is still that the
-            # changed source is detected and never published.
+            # A platform may keep the opened source path bound while the
+            # callback replaces its contents; it must still fail publication.
             self.assertEqual(b"replacement", source.read_bytes())
         self.assert_no_temps()
 
