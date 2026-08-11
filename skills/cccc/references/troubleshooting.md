@@ -20,7 +20,7 @@ Run `codex login status` or `claude auth status`. If a custom provider is config
 
 ## Model or effort failure
 
-`CCCC_MODEL` and `CCCC_EFFORT` are passed only when explicitly set. Model names and effort levels are provider-dependent; confirm that the active account/provider supports them. Codex consult defaults to `xhigh`, so choose a supported value explicitly if the configured provider rejects it.
+Model names and effort levels are provider-dependent. Delegate leaves effort unset. Claude consult leaves effort unset; Codex consult defaults to `xhigh`. Claude accepts `low`, `medium`, `high`, `xhigh`, or `max`; Codex accepts `minimal`, `low`, `medium`, `high`, or `xhigh`. Choose a supported value explicitly when the provider rejects the default or requested value.
 
 ## Output collision or partial publication
 
@@ -37,6 +37,8 @@ The wrappers require Python 3 and invoke helpers in isolated mode. Check `python
 ## Legacy path or stale installation
 
 Codex uses `~/.agents/skills/cccc`. `~/.codex/skills/cccc` is a legacy path and can leave an older copy active during migration. Resolve both links, verify which `SKILL.md` and scripts they reference, and follow the rollback procedure in [setup](setup.md). If metadata still looks stale after paths are correct, restart the host once.
+
+Legacy delegate variables are deprecated compatibility fallbacks. Consult does not accept them and rejects `DELEGATE_SANDBOX`; use the documented `CCCC_*` controls instead.
 
 ## Unsafe or hostile input
 

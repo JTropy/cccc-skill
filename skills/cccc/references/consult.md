@@ -23,7 +23,11 @@ bash /absolute/path/to/skills/cccc/scripts/consult.sh \
   <claude|codex> docs/discussions/<name>.md
 ```
 
-Optional controls are `CCCC_TIMEOUT` (`1800` seconds by default, `0` for no deadline), `CCCC_MODEL`, and target-valid `CCCC_EFFORT`. `CCCC_ALLOW_DIRTY=1` admits and fingerprints an existing dirty baseline; without it, consult refuses to start from a dirty repository.
+An optional third argument selects the worktree. Always choose the peer target: a Codex orchestrator targets Claude; a Claude Code orchestrator targets Codex.
+
+Optional controls are `CCCC_TIMEOUT` (`1800` seconds by default, `0` for no deadline), `CCCC_MODEL`, and `CCCC_EFFORT`. Claude accepts `low`, `medium`, `high`, `xhigh`, or `max`; Codex accepts `minimal`, `low`, `medium`, `high`, or `xhigh`. Claude consult leaves effort unset by default; Codex consult defaults to `xhigh`. `CCCC_ALLOW_DIRTY=1` admits and fingerprints an existing dirty baseline.
+
+Consult forbids the write-enabling delegate controls `CCCC_MODE`, `CCCC_ALLOW_FULL`, and `DELEGATE_SANDBOX`. It does not inherit legacy delegate variables. Without `CCCC_ALLOW_DIRTY=1`, consult refuses a dirty repository.
 
 The wrapper publishes `<card-stem>-<target>-opinion.md` and `<card-stem>-<target>.log` without overwriting an existing file. It also serializes against delegate and consult work for the same physical repository.
 

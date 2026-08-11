@@ -4,9 +4,9 @@ Use this path only after the authorization gate in `SKILL.md` has passed and the
 
 ## Prepare the task card
 
-1. Copy [the task-card template](../assets/task-card.md) to `docs/tasks/<name>.md`.
+1. Use an already tracked task card in a clean baseline, or copy [the task-card template](../assets/task-card.md) to `docs/tasks/<name>.md` and explicitly admit that new file with `CCCC_ALLOW_DIRTY=1`. A newly created untracked card makes the default clean-worktree check fail.
 2. State one concrete objective, the context the cold-start peer needs, and exact acceptance checks.
-3. Fill the machine-readable `cccc-allowed-paths` block with the smallest repository-relative files or directory prefixes. Do not use globs, absolute paths, `..`, symlinks, Git metadata paths, or a rule covering the task card or one of its ancestors.
+3. Fill the machine-readable `cccc-allowed-paths` block with the smallest repository-relative files or directory prefixes. Existing directories must end in `/`; file rules must not. Do not use globs, absolute paths, `..`, symlinks, Git metadata paths, or a rule covering the task card or one of its ancestors.
 4. Tell the peer not to invoke another agent or alter repository history.
 
 Allowed paths are a post-run Git-visible audit boundary. The snapshot covers tracked files and non-ignored untracked files. Git metadata and Git-ignored paths are outside the audit. This is not an OS sandbox, so use an external isolation boundary for an untrusted task or repository.
@@ -21,7 +21,12 @@ Allowed paths are a post-run Git-visible audit boundary. The snapshot covers tra
 
 The wrapper rejects a dirty worktree by default. `CCCC_ALLOW_DIRTY=1` is an explicit escape hatch: it fingerprints the admitted baseline and detects a second change, but Git metadata and Git-ignored paths remain outside the audit.
 
-Optional controls are `CCCC_TIMEOUT` in seconds (`0` means no deadline), `CCCC_MODEL`, and target-valid `CCCC_EFFORT`. Do not promise that a configured model, provider, effort, network path, or image capability exists; verify it first.
+Optional controls are `CCCC_TIMEOUT` in seconds (default `3600`; `0` means no deadline), `CCCC_MODEL`, and `CCCC_EFFORT`. Valid effort values are:
+
+- Claude: `low`, `medium`, `high`, `xhigh`, or `max`.
+- Codex: `minimal`, `low`, `medium`, `high`, or `xhigh`.
+
+Unset effort inherits the peer CLI/configured default. Legacy delegate variables remain deprecated compatibility fallbacks; prefer the `CCCC_*` names. Do not promise that a configured model, provider, effort, network path, or image capability exists; verify it first.
 
 ## Invoke
 

@@ -193,6 +193,42 @@ class ValidateSkillTests(unittest.TestCase):
         self.assertRegex(troubleshooting, r"\| `5` \|[^\n]*(?:empty|unsafe)")
         self.assertRegex(troubleshooting, r"\| `70` \|[^\n]*peer[^\n]*(?:exit|signal)")
 
+    def test_workflow_references_state_operational_prerequisites_exactly(self) -> None:
+        skill = self.canonical_text("SKILL.md")
+        self.assertLessEqual(len(skill.split()), 500)
+        self.assertIn("tool restrictions", skill.lower())
+        self.assertIn("post-run git audit", skill.lower())
+
+        delegate = self.canonical_text("references/delegate.md").lower()
+        self.assertRegex(delegate, r"task card[\s\S]{0,500}(?:clean baseline|cccc_allow_dirty=1)")
+        self.assertIn("existing directories must end in `/`", delegate)
+        self.assertIn("3600", delegate)
+        self.assertIn("claude: `low`, `medium`, `high`, `xhigh`, or `max`", delegate)
+        self.assertIn("codex: `minimal`, `low`, `medium`, `high`, or `xhigh`", delegate)
+
+        consult = self.canonical_text("references/consult.md")
+        consult_lower = consult.lower()
+        self.assertIn("optional third argument", consult_lower)
+        self.assertIn("codex orchestrator targets claude", consult_lower)
+        self.assertIn("claude code orchestrator targets codex", consult_lower)
+        for forbidden_env in ("CCCC_MODE", "CCCC_ALLOW_FULL", "DELEGATE_SANDBOX"):
+            self.assertIn(forbidden_env, consult)
+
+        setup = self.canonical_text("references/setup.md")
+        self.assertIn('mkdir -p "$(dirname "$install_root")"', setup)
+        self.assertNotIn("fast-forward the neutral checkout", setup.lower())
+        self.assertNotIn("pull --ff-only", setup.lower())
+        self.assertRegex(setup.lower(), r"candidate[\s\S]{0,300}validat[\s\S]{0,300}switch")
+        self.assertRegex(setup.lower(), r"claude auth status[\s\S]{0,300}(?:does not|independent)")
+        self.assertRegex(setup.lower(), r"reload[\s\S]{0,200}(?:host|version).*restart")
+
+        troubleshooting = self.canonical_text("references/troubleshooting.md").lower()
+        self.assertIn("delegate leaves effort unset", troubleshooting)
+        self.assertIn("claude consult leaves effort unset", troubleshooting)
+        self.assertIn("codex consult defaults to `xhigh`", troubleshooting)
+        self.assertIn("legacy delegate variables", troubleshooting)
+        self.assertIn("consult does not accept them", troubleshooting)
+
     def test_legacy_root_skill_entrypoints_are_removed(self) -> None:
         for legacy in ("SKILL.md", "agents/openai.yaml", "references/setup.md"):
             self.assertFalse((REPOSITORY_ROOT / legacy).exists(), legacy)
