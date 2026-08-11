@@ -80,7 +80,9 @@ package.json
 -->
 ```
 
-每行表示一个仓库相对文件或目录前缀，不接受 glob、绝对路径与 `..`。wrapper 用 Git 前后快照验证本轮 tracked 与非 ignored untracked 变化全部落在允许范围内；Git-ignored 路径始终不在该审计边界，wrapper 每次运行都明确警告，不能把允许路径描述为操作系统级写入隔离。人类可读的“边界”章节仍保留，用来解释理由和禁止项。
+每行表示一个仓库相对文件或目录前缀，不接受 glob、绝对路径与 `..`。解析策略时拒绝任何已存在的 symlink 路径组件，并验证最深的已存在父目录仍位于物理仓库根内；尚不存在的新路径仍只能得到事后审计，不能形成操作系统级写入隔离。wrapper 用 Git 前后快照验证本轮 tracked 与非 ignored untracked 变化全部落在允许范围内；Git-ignored 路径始终不在该审计边界，wrapper 每次运行都明确警告。
+
+为避免 dirty baseline 下出现不可见的二次变化，v2 遇到 submodule/gitlink 或 Git 视为单个目录项的嵌套仓库时 fail closed；在实现递归指纹前，不把这类目录描述为已审计。人类可读的“边界”章节仍保留，用来解释理由和禁止项。
 
 运行前：
 
