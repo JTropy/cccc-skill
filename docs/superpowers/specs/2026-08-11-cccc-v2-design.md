@@ -80,7 +80,7 @@ package.json
 -->
 ```
 
-每行表示一个仓库相对文件或目录前缀，不接受 glob、绝对路径与 `..`。解析策略时拒绝任何已存在的 symlink 路径组件，并验证最深的已存在父目录仍位于物理仓库根内；尚不存在的新路径仍只能得到事后审计，不能形成操作系统级写入隔离。wrapper 用 Git 前后快照验证本轮 tracked 与非 ignored untracked 变化全部落在允许范围内；Git-ignored 路径始终不在该审计边界，wrapper 每次运行都明确警告。
+每行表示一个仓库相对文件或目录前缀，不接受 glob、绝对路径与 `..`。任一层级的 `.git` 路径组件（大小写不敏感）及其后代永不允许，因为普通仓库的 Git metadata 目录、嵌套仓库 metadata 和 linked worktree 的 `.git` 指针都不在工作树内容快照内。解析策略时拒绝任何已存在的 symlink 路径组件，并验证最深的已存在父目录仍位于物理仓库根内；尚不存在的新路径仍只能得到事后审计，不能形成操作系统级写入隔离。wrapper 用 Git 前后快照验证本轮 tracked 与非 ignored untracked 变化全部落在允许范围内；Git metadata 与 Git-ignored 路径始终不在该审计边界，wrapper 每次运行都明确警告。
 
 为避免 dirty baseline 下出现不可见的二次变化，v2 遇到 submodule/gitlink 或 Git 视为单个目录项的嵌套仓库时 fail closed；在实现递归指纹前，不把这类目录描述为已审计。人类可读的“边界”章节仍保留，用来解释理由和禁止项。
 
@@ -111,7 +111,7 @@ Claude 顾问采用 `--safe-mode`、`--tools Read,Glob,Grep`、`--permission-mod
 
 Codex 顾问默认采用 `--ephemeral --sandbox read-only --ignore-user-config --ignore-rules`，保留 CLI 认证但不加载用户规则、MCP 与自定义 provider，形成严格模式。依赖 custom provider 的用户可显式设置 `CCCC_CODEX_CONFIG_MODE=inherit`；此时仍有文件系统只读沙箱，但 wrapper 必须警告第三方 MCP/connector 可能具有外部副作用，不能再宣称完整只读。
 
-consult 默认要求 clean worktree；显式使用 dirty 逃生口时，wrapper 对所有 Git tracked 与非 ignored untracked 路径做内容指纹快照，并警告 ignored 路径不在审计边界内。顾问运行前后 HEAD 或该快照出现任何变化都视为只读策略失守。观点与日志都带 target 后缀，使同一议题可分别咨询两端。文档统一使用“只读第二意见”，不承诺双方一定形成共识。
+consult 默认要求 clean worktree；显式使用 dirty 逃生口时，wrapper 对所有 Git tracked 与非 ignored untracked 路径做内容指纹快照，并警告 Git metadata 与 ignored 路径不在审计边界内。顾问运行前后 HEAD 或该快照出现任何变化都视为只读策略失守。观点与日志都带 target 后缀，使同一议题可分别咨询两端。文档统一使用“只读第二意见”，不承诺双方一定形成共识。
 
 ## 超时与进程清理
 
