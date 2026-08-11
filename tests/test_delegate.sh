@@ -331,23 +331,70 @@ import hmac
 import os
 import stat
 import sys
+import time
 
 token_path, status_path = sys.argv[1:3]
-token_before = os.lstat(token_path)
-flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-token_fd = os.open(token_path, flags)
+
+
+def fail(stage, error=None):
+    detail = ""
+    if error is not None:
+        detail = " winerror=%r error=%s" % (getattr(error, "winerror", None), error)
+    print("cccc-test-auth-status: %s%s" % (stage, detail), file=sys.stderr)
+    raise SystemExit(125)
+
+
+try:
+    token_before = os.lstat(token_path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    token_fd = os.open(token_path, flags)
+except OSError as error:
+    fail("open token", error)
 try:
     token_opened = os.fstat(token_fd)
     if not stat.S_ISREG(token_opened.st_mode):
-        raise SystemExit(125)
+        fail("token is not regular")
     if (token_before.st_dev, token_before.st_ino) != (token_opened.st_dev, token_opened.st_ino):
-        raise SystemExit(125)
+        fail("token identity changed while opening")
     token = os.read(token_fd, 33)
 finally:
     os.close(token_fd)
 if len(token) != 32:
-    raise SystemExit(125)
-os.unlink(token_path)
+    fail("token length is not 32 bytes")
+
+unlink_requested = False
+for attempt in range(21):
+    try:
+        token_current = os.lstat(token_path)
+        if (token_opened.st_dev, token_opened.st_ino) != (
+            token_current.st_dev,
+            token_current.st_ino,
+        ):
+            fail("token identity changed before removal")
+        os.unlink(token_path)
+        unlink_requested = True
+        try:
+            token_after = os.lstat(token_path)
+        except FileNotFoundError:
+            break
+        if (token_opened.st_dev, token_opened.st_ino) != (
+            token_after.st_dev,
+            token_after.st_ino,
+        ):
+            fail("token path was replaced after removal")
+        if os.name != "nt" or attempt == 20:
+            fail("token still exists after removal")
+        time.sleep(0.05)
+    except FileNotFoundError as error:
+        if unlink_requested:
+            break
+        fail("token disappeared before removal", error)
+    except OSError as error:
+        if os.name != "nt" or getattr(error, "winerror", None) not in (5, 32, 33):
+            fail("remove token", error)
+        if attempt == 20:
+            fail("remove token retry limit", error)
+        time.sleep(0.05)
 if status_path == "-":
     raise SystemExit(0)
 kind, value = sys.argv[3:5]
@@ -1112,6 +1159,7 @@ if [ "$intercept" -eq 1 ]; then
   printf 'outside during cleanup failure\n' >"$CCCC_FAKE_REPO/bad/cleanup-outside.txt"
   if [ -n "$status_file" ] && [ -n "$token_file" ]; then
     auth_helper=$CCCC_AUTH_STATUS_HELPER
+    token_file_posix=$token_file
     case ${MSYSTEM-} in
       MINGW*|MSYS*|UCRT*)
         auth_helper=$(cygpath -w "$auth_helper") || exit 125
@@ -1119,8 +1167,28 @@ if [ "$intercept" -eq 1 ]; then
         status_file=$(cygpath -w "$status_file") || exit 125
         ;;
     esac
-    "$CCCC_REAL_PYTHON" -I "$auth_helper" \
-      "$token_file" "$status_file" cleanup-failure none || exit 125
+    auth_output=$("$CCCC_REAL_PYTHON" -I "$auth_helper" \
+      "$token_file" "$status_file" cleanup-failure none 2>&1)
+    auth_rc=$?
+    if [ "$auth_rc" -ne 0 ]; then
+      printf '%s\n' "$auth_output" >"$CCCC_FAKE_REPO/bad/auth-helper-error.txt"
+      exit 125
+    fi
+    case ${MSYSTEM-} in
+      MINGW*|MSYS*|UCRT*)
+        attempts=0
+        while [ -e "$token_file_posix" ] || [ -L "$token_file_posix" ]; do
+          attempts=$((attempts + 1))
+          if [ "$attempts" -ge 20 ]; then
+            printf '%s\n' 'cccc-test-auth-status: MSYS token removal visibility timeout' \
+              >"$CCCC_FAKE_REPO/bad/auth-helper-error.txt"
+            exit 125
+          fi
+          sleep 0.05
+        done
+        ;;
+    esac
+    printf '%s\n' passed >"$CCCC_FAKE_REPO/bad/auth-barrier-passed.txt"
   fi
   printf '%s\n' 'cccc-timeout: cleanup failed: injected wrapper test' >&2
   exit 125
@@ -1134,8 +1202,15 @@ CLEANUP_SHIM
     test_diag 'cleanup-failure shim did not create the policy violation'
     return 1
   }
+  [ -e "$CASE_REPO/bad/auth-barrier-passed.txt" ] || {
+    test_diag 'cleanup-failure token visibility barrier did not complete'
+    return 1
+  }
   case "$CASE_OUTPUT" in *'runner outcome: kind=cleanup-failure'*) return 0 ;; esac
   test_diag "cleanup-failure outcome was not authenticated: $CASE_OUTPUT"
+  if [ -s "$CASE_REPO/bad/auth-helper-error.txt" ]; then
+    test_diag "auth helper: $(tr '\n' ' ' <"$CASE_REPO/bad/auth-helper-error.txt")"
+  fi
   return 1
 }
 
@@ -2535,6 +2610,7 @@ done
 if [ -n "$status_file" ]; then
   if [ -n "$token_file" ]; then
     auth_helper=$CCCC_AUTH_STATUS_HELPER
+    token_file_posix=$token_file
     case ${MSYSTEM-} in
       MINGW*|MSYS*|UCRT*)
         auth_helper=$(cygpath -w "$auth_helper") || exit 125
@@ -2542,8 +2618,28 @@ if [ -n "$status_file" ]; then
         status_file=$(cygpath -w "$status_file") || exit 125
         ;;
     esac
-    "$CCCC_REAL_PYTHON" -I "$auth_helper" \
-      "$token_file" "$status_file" child-exit 4294967295 || exit 125
+    auth_output=$("$CCCC_REAL_PYTHON" -I "$auth_helper" \
+      "$token_file" "$status_file" child-exit 4294967295 2>&1)
+    auth_rc=$?
+    if [ "$auth_rc" -ne 0 ]; then
+      printf '%s\n' "$auth_output" >"$CCCC_UINT_AUTH_ERROR"
+      exit 125
+    fi
+    case ${MSYSTEM-} in
+      MINGW*|MSYS*|UCRT*)
+        attempts=0
+        while [ -e "$token_file_posix" ] || [ -L "$token_file_posix" ]; do
+          attempts=$((attempts + 1))
+          if [ "$attempts" -ge 20 ]; then
+            printf '%s\n' 'cccc-test-auth-status: MSYS token removal visibility timeout' \
+              >"$CCCC_UINT_AUTH_ERROR"
+            exit 125
+          fi
+          sleep 0.05
+        done
+        ;;
+    esac
+    printf '%s\n' passed >"$CCCC_UINT_AUTH_BARRIER"
   else
     printf '%s\n' \
       'cccc-timeout-result-v1 kind=child-exit value=4294967295' >"$status_file"
@@ -2553,8 +2649,22 @@ fi
 exec "$CCCC_REAL_PYTHON" "$@"
 WINDOWS_LARGE_STATUS_SHIM
   chmod +x "$CASE_BIN/python3" || return 1
-  CCCC_REAL_PYTHON="$real_python" run_delegate codex
-  assert_eq 70 "$CASE_RC" 'Windows UINT child-exit mapping'
+  CCCC_REAL_PYTHON="$real_python" \
+    CCCC_UINT_AUTH_BARRIER="$CASE_DIR/uint-auth-barrier-passed.txt" \
+    CCCC_UINT_AUTH_ERROR="$CASE_DIR/uint-auth-helper-error.txt" run_delegate codex
+  [ -e "$CASE_DIR/uint-auth-barrier-passed.txt" ] || {
+    test_diag 'Windows UINT token visibility barrier did not complete'
+    if [ -s "$CASE_DIR/uint-auth-helper-error.txt" ]; then
+      test_diag "auth helper: $(tr '\n' ' ' <"$CASE_DIR/uint-auth-helper-error.txt")"
+    fi
+    return 1
+  }
+  assert_eq 70 "$CASE_RC" 'Windows UINT child-exit mapping' || return 1
+  case "$CASE_OUTPUT" in
+    *'runner outcome: kind=child-exit agent_rc=4294967295'*) return 0 ;;
+  esac
+  test_diag "Windows UINT outcome was not authenticated: $CASE_OUTPUT"
+  return 1
 }
 
 test_repo_lock_signal_window_cleans_before_retry() {
