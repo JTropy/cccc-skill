@@ -6,10 +6,15 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
+import importlib.util
 
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "skills" / "cccc" / "scripts" / "run-with-timeout.py"
+RUNNER_SPEC = importlib.util.spec_from_file_location("run_with_timeout", RUNNER)
+RUNNER_MODULE = importlib.util.module_from_spec(RUNNER_SPEC)
+RUNNER_SPEC.loader.exec_module(RUNNER_MODULE)
 
 
 def command(*args):
@@ -81,6 +86,34 @@ class TimeoutRunnerTests(unittest.TestCase):
         result = self.run_runner(2, *child("import sys; sys.exit(124)"))
         self.assertEqual(result.returncode, 124)
         self.assertNotIn(b"cccc-timeout:", result.stderr)
+
+
+class TimeoutRunnerUnitTests(unittest.TestCase):
+    def test_posix_grace_sleep_never_passes_deadline(self):
+        process = mock.Mock()
+        with mock.patch.object(RUNNER_MODULE, "process_group_exists", return_value=True), \
+             mock.patch.object(RUNNER_MODULE.os, "killpg") as killpg, \
+             mock.patch.object(RUNNER_MODULE.time, "monotonic", side_effect=[10, 11.99, 12]), \
+             mock.patch.object(RUNNER_MODULE.time, "sleep") as sleep:
+            RUNNER_MODULE.stop_posix(process)
+
+        sleep.assert_called_once()
+        self.assertAlmostEqual(sleep.call_args.args[0], 0.01)
+        self.assertEqual(
+            [call.args[1] for call in killpg.call_args_list],
+            [RUNNER_MODULE.signal.SIGTERM, RUNNER_MODULE.signal.SIGKILL],
+        )
+        process.wait.assert_called_once_with()
+
+    def test_windows_timeout_kills_after_terminate_grace_expires(self):
+        process = mock.Mock()
+        process.wait.side_effect = [subprocess.TimeoutExpired(["child"], 2), 0]
+
+        RUNNER_MODULE.stop_windows(process)
+
+        process.terminate.assert_called_once_with()
+        self.assertEqual(process.wait.call_args_list, [mock.call(timeout=2), mock.call()])
+        process.kill.assert_called_once_with()
 
 
 @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")

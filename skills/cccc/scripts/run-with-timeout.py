@@ -45,11 +45,14 @@ def stop_posix(process):
         pass
 
     deadline = time.monotonic() + 2
-    while process_group_exists(process_group) and time.monotonic() < deadline:
+    while process_group_exists(process_group):
         process.poll()
         if not process_group_exists(process_group):
             break
-        time.sleep(0.05)
+        remaining = max(0, deadline - time.monotonic())
+        if remaining == 0:
+            break
+        time.sleep(min(0.05, remaining))
 
     if process_group_exists(process_group):
         try:
