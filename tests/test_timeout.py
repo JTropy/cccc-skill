@@ -235,7 +235,7 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
 
         def assign(_process):
             events.append("assign")
-            return job, None
+            return job, None, None
 
         gate.set.side_effect = lambda: events.append("set") or None
         with mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
@@ -244,7 +244,7 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
              ), \
              mock.patch.object(RUNNER_MODULE.subprocess, "Popen", side_effect=launch), \
              mock.patch.object(RUNNER_MODULE, "create_windows_job", side_effect=assign):
-            bootstrap, created_gate, assigned_job, error = RUNNER_MODULE.launch_windows_bootstrap(
+            bootstrap, created_gate, assigned_job, error, status = RUNNER_MODULE.launch_windows_bootstrap(
                 ["target", "argument"]
             )
 
@@ -252,24 +252,89 @@ class TimeoutRunnerUnitTests(unittest.TestCase):
         self.assertIs(created_gate, gate)
         self.assertIs(assigned_job, job)
         self.assertIsNone(error)
+        self.assertIsNone(status)
         self.assertEqual(events, ["popen", "assign", "set"])
 
     def test_windows_assignment_failure_never_releases_gate(self):
         process = mock.Mock()
         gate = mock.Mock()
         gate.name = "Local\\cccc-test-gate"
+        gate.close.return_value = None
         with mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
              mock.patch.object(
                  RUNNER_MODULE.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
              ), \
              mock.patch.object(RUNNER_MODULE.subprocess, "Popen", return_value=process), \
              mock.patch.object(
-                 RUNNER_MODULE, "create_windows_job", return_value=(None, "assignment failed")
+                 RUNNER_MODULE, "create_windows_job", return_value=(None, "assignment failed", None)
              ):
-            _bootstrap, _gate, _job, error = RUNNER_MODULE.launch_windows_bootstrap(["target"])
+            _bootstrap, _gate, _job, error, status = RUNNER_MODULE.launch_windows_bootstrap(["target"])
 
         self.assertIn("assignment failed", error)
+        self.assertEqual(status, 127)
         gate.set.assert_not_called()
+
+    def test_windows_gate_creation_failure_is_setup_error(self):
+        with mock.patch.object(RUNNER_MODULE, "WindowsGate", side_effect=OSError("gate failed")), \
+             mock.patch.object(RUNNER_MODULE.subprocess, "Popen") as launch:
+            bootstrap, gate, job, error, status = RUNNER_MODULE.launch_windows_bootstrap(["target"])
+
+        self.assertIsNone(bootstrap)
+        self.assertIsNone(gate)
+        self.assertIsNone(job)
+        self.assertIn("could not create", error)
+        self.assertEqual(status, 127)
+        launch.assert_not_called()
+
+    def test_windows_bootstrap_popen_failure_is_setup_error(self):
+        gate = mock.Mock()
+        gate.name = "Local\\cccc-test-gate"
+        gate.close.return_value = None
+        with mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
+             mock.patch.object(
+                 RUNNER_MODULE.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
+             ), \
+             mock.patch.object(RUNNER_MODULE.subprocess, "Popen", side_effect=OSError("launch failed")):
+            _bootstrap, _gate, _job, error, status = RUNNER_MODULE.launch_windows_bootstrap(["target"])
+
+        self.assertIn("could not start", error)
+        self.assertEqual(status, 127)
+        gate.close.assert_called_once_with()
+
+    def test_windows_assignment_cleanup_failure_is_125(self):
+        process = mock.Mock()
+        gate = mock.Mock()
+        gate.name = "Local\\cccc-test-gate"
+        gate.close.return_value = None
+        with mock.patch.object(RUNNER_MODULE, "WindowsGate", return_value=gate), \
+             mock.patch.object(
+                 RUNNER_MODULE.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
+             ), \
+             mock.patch.object(RUNNER_MODULE.subprocess, "Popen", return_value=process), \
+             mock.patch.object(
+                 RUNNER_MODULE,
+                 "create_windows_job",
+                 return_value=(None, "assignment failed", "process did not exit"),
+             ):
+            _bootstrap, _gate, _job, error, status = RUNNER_MODULE.launch_windows_bootstrap(["target"])
+
+        self.assertIn("process did not exit", error)
+        self.assertEqual(status, 125)
+        gate.set.assert_not_called()
+
+    def test_windows_run_uses_explicit_bootstrap_setup_status(self):
+        stderr = io.StringIO()
+        with mock.patch.object(RUNNER_MODULE.os, "name", "nt"), \
+             mock.patch.object(
+                 RUNNER_MODULE,
+                 "launch_windows_bootstrap",
+                 return_value=(None, None, None, "could not create bootstrap gate", 127),
+             ), \
+             mock.patch.object(RUNNER_MODULE.sys, "stderr", stderr):
+            status = RUNNER_MODULE.run(["1", "--", "target"])
+
+        self.assertEqual(status, 127)
+        self.assertIn("could not create bootstrap gate", stderr.getvalue())
 
     def test_windows_bootstrap_parent_death_does_not_start_target(self):
         with mock.patch.object(RUNNER_MODULE, "wait_for_windows_bootstrap_gate", return_value="parent"), \

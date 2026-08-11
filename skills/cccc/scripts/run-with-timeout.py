@@ -302,12 +302,10 @@ def create_windows_job(process):
     try:
         job = WindowsJob()
         job.assign(process)
-        return job, None
+        return job, None, None
     except OSError as exc:
         cleanup_error = stop_windows(process, job)
-        return None, join_cleanup_errors(
-            f"Windows Job Object assignment failed: {exc}", cleanup_error
-        )
+        return None, f"Windows Job Object assignment failed: {exc}", cleanup_error
 
 
 def launch_windows_bootstrap(command):
@@ -315,7 +313,7 @@ def launch_windows_bootstrap(command):
     try:
         gate = WindowsGate()
     except OSError as exc:
-        return None, None, None, f"could not create Windows bootstrap gate: {exc}"
+        return None, None, None, f"could not create Windows bootstrap gate: {exc}", 127
     bootstrap_command = [
         sys.executable,
         os.path.abspath(__file__),
@@ -331,18 +329,21 @@ def launch_windows_bootstrap(command):
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
     except OSError as exc:
-        close_error = gate.close()
-        return None, gate, None, join_cleanup_errors(
-            f"could not start Windows bootstrap: {exc}", close_error
+        gate.close()
+        return None, gate, None, f"could not start Windows bootstrap: {exc}", 127
+    job, setup_error, cleanup_error = create_windows_job(process)
+    if setup_error:
+        cleanup_error = join_cleanup_errors(cleanup_error, gate.close())
+        return process, gate, None, join_cleanup_errors(setup_error, cleanup_error), (
+            125 if cleanup_error else 127
         )
-    job, error = create_windows_job(process)
-    if error:
-        return process, gate, None, error
     release_error = gate.set()
     if release_error:
-        cleanup_error = stop_windows(process, job)
-        return process, gate, None, join_cleanup_errors(release_error, cleanup_error)
-    return process, gate, job, None
+        cleanup_error = join_cleanup_errors(stop_windows(process, job), gate.close())
+        return process, gate, None, join_cleanup_errors(release_error, cleanup_error), (
+            125 if cleanup_error else 127
+        )
+    return process, gate, job, None, None
 
 
 def wait_for_windows_bootstrap_gate(event_name, parent_pid):
@@ -430,9 +431,13 @@ def run(argv):
     try:
         try:
             if os.name == "nt":
-                process, gate, job, error = launch_windows_bootstrap(command)
+                process, gate, job, error, error_status = launch_windows_bootstrap(command)
                 if error:
-                    result = cleanup_failed(error)
+                    if error_status == 125:
+                        result = cleanup_failed(error)
+                    else:
+                        print(f"cccc-timeout: {error}", file=sys.stderr)
+                        result = error_status
             else:
                 process = subprocess.Popen(command, **options)
             if interrupt_state is not None:
