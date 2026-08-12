@@ -1212,6 +1212,9 @@ CLEANUP_SHIM
   }
   [ -e "$CASE_REPO/bad/auth-barrier-passed.txt" ] || {
     test_diag 'cleanup-failure token visibility barrier did not complete'
+    if [ -s "$CASE_REPO/bad/auth-helper-error.txt" ]; then
+      test_diag "auth helper: $(tr '\n' ' ' <"$CASE_REPO/bad/auth-helper-error.txt")"
+    fi
     return 1
   }
   case "$CASE_OUTPUT" in *'runner outcome: kind=cleanup-failure'*) return 0 ;; esac
