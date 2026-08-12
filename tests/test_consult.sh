@@ -1229,6 +1229,9 @@ test_runner_status_hmac_namespace_and_rc_mismatches_fail_closed() {
       continue
     fi
     prepare_case || return 1
+    if [ "$mode" = symlink ]; then
+      require_symlink_capability "$CASE_DIR" || continue
+    fi
     install_runner_status_shim "$real_python" "$mode" || return 1
     marker="$CASE_DIR/status-attack-marker"
     [ "$mode" = symlink ] || printf 'referent\n' >"$CASE_DIR/referent"
