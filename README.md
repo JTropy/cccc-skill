@@ -1,29 +1,48 @@
-# cccc — Claude Code × Codex peer collaboration
+# cccc — Claude Code Codex Collaboration
 
-`cccc` lets a local Claude Code CLI and Codex CLI act as bounded peers while the current agent remains the orchestrator. It has two channels:
+`cccc` 是一个让 Claude Code 与 Codex 协作的通用 skill。同一份 skill 同时安装在两个宿主中，会根据当前编排上下文自动识别当前宿主，并把任务路由给另一端：Claude Code 调用 Codex，Codex 调用 Claude Code。底层 wrapper 仍保留显式目标参数，便于审计和排障。
 
-| Channel | Use | Published artifacts |
+它让两端不只是“互相问一句”，而是按明确边界发挥各自能力：
+
+- **Claude Code → Codex**：可把生图、图片编辑等视觉任务交给 Codex 的 `$imagegen` 能力。
+- **Codex → Claude Code**：可把顶层设计、架构推演和方案评审交给 Claude Code，并在当前环境支持时请求 Fable 5。
+
+`$imagegen`、Fable 5、具体模型、effort、网络和供应商能力都需要根据当前 CLI、账号、供应商与工作区实际验证；本 skill 不承诺它们在所有环境中可用。
+
+## 它如何协作
+
+当前宿主始终是编排者，另一端是受边界约束的协作伙伴。`cccc` 提供两条正式通道：
+
+| 通道 | 用途 | 发布产物 |
 |---|---|---|
-| `delegate` | Scoped repository implementation inside card-defined paths | report and audit log |
-| `consult` | Independent analysis or critique without authorizing implementation | opinion and audit log |
+| `delegate` | 在任务卡允许的路径内执行受限仓库实现 | 报告与审计日志 |
+| `consult` | 在不授权实施的前提下进行独立分析、批评或方案评审 | 意见与审计日志 |
 
-The wrappers provide no-clobber publication, process timeouts, repository serialization, and before/after Git-visible audits. They are not an operating-system sandbox. Git metadata, ignored paths, same-user readable files, secrets, and intentionally detached processes remain outside parts of this boundary. Wrapper exit status `0`—not the mere presence of an artifact—is the success signal.
+使用同一份 skill 的路由规则如下：
 
-Skill discovery is not permission to launch another CLI. A launch requires an explicit cccc/4C or local-peer request, or confirmation after the orchestrator suggests a peer handoff.
+- 当前是 Claude Code：选择 Codex 作为 peer。
+- 当前是 Codex：选择 Claude Code 作为 peer。
+- 不把自己再次选为目标，也不根据某个可执行文件是否存在来猜测身份。
 
-## Requirements
+## 安全与授权边界
 
-- Git, Bash 3.2+, and Python 3
-- `claude` and `codex` available on `PATH`
-- usable authentication for the selected peer CLI
-- a Git repository containing a task or discussion card
-- Git Bash on Windows
+发现这个 skill 不等于获得启动另一个 CLI 的权限。只有用户明确提出 cccc/4C、本地 peer 协作或 wrapper 调用，或者编排者提出建议后得到确认，才可以启动另一端。
 
-Model, effort, provider, network, and `$imagegen` availability are capabilities to verify, not guarantees made by this skill.
+wrapper 提供无覆盖发布、进程超时、仓库级串行化，以及运行前后的 Git 可见变更审计。它不是操作系统沙箱：Git 元数据、Git ignored 路径、同一用户可读取的文件、密钥，以及故意脱离管理的进程，仍有部分处于该边界之外。不可信仓库应放进外部容器和隔离 worktree。
 
-## Install on macOS or Linux
+退出码 `0` 才是成功依据；仅看到报告、意见或日志文件存在，不代表任务成功。`consult` 的意见只是建议，不授权代码修改；所有结果都必须由当前编排者复核。
 
-Keep one stable checkout and link only its canonical `skills/cccc` directory into both hosts:
+## 环境要求
+
+- Git、Bash 3.2+ 与 Python 3
+- `claude` 和 `codex` 均可从 `PATH` 调用
+- 目标 peer CLI 已完成可用认证
+- Git 仓库中存在任务卡或讨论卡
+- Windows 使用 Git Bash
+
+## 在 macOS 或 Linux 上安装
+
+保留一份稳定 checkout，只把其中规范的 `skills/cccc` 目录链接到两个宿主：
 
 ```bash
 install_root="${XDG_DATA_HOME:-$HOME/.local/share}/cccc-skill"
@@ -34,16 +53,16 @@ ln -s "$install_root/skills/cccc" "$HOME/.claude/skills/cccc"
 chmod +x "$install_root/skills/cccc/scripts/"*.sh
 ```
 
-The canonical user paths are:
+用户级规范路径：
 
-- Codex: `~/.agents/skills/cccc`
-- Claude Code: `~/.claude/skills/cccc`
+- Codex：`~/.agents/skills/cccc`
+- Claude Code：`~/.claude/skills/cccc`
 
-Project-local installs use `<repo>/.agents/skills/cccc` and `<repo>/.claude/skills/cccc`.
+项目级安装使用 `<repo>/.agents/skills/cccc` 与 `<repo>/.claude/skills/cccc`。
 
-## Install on Windows
+## 在 Windows 上安装
 
-In PowerShell, clone a real target first, create both parent directories, then create two Junction entries:
+在 PowerShell 中先克隆真实目标，再创建两个父目录和两个 Junction：
 
 ```powershell
 $InstallRoot = "$env:LOCALAPPDATA\cccc-skill"
@@ -54,31 +73,31 @@ New-Item -ItemType Junction -Path "$env:USERPROFILE\.agents\skills\cccc" -Target
 New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\cccc" -Target "$InstallRoot\skills\cccc"
 ```
 
-If a host version cannot follow a directory link, use a copy fallback for that host only:
+如果某个宿主版本无法跟随目录链接，只对该宿主使用复制兜底：
 
 ```powershell
 Copy-Item -Recurse "$InstallRoot\skills\cccc" "$env:USERPROFILE\.claude\skills\cccc"
 ```
 
-Keep copied installations synchronized manually. Do not overlay a second `cccc` directory inside an existing one.
+复制安装需要手动保持同步。不要在已有 `cccc` 目录内再叠加第二个 `cccc` 目录。
 
-## Migrate from v1
+## 从 v1 迁移
 
-v2 moved the installable entrypoint from the repository root to `skills/cccc` and moved Codex's canonical user location to `.agents`.
+v2 将可安装入口从仓库根目录移动到 `skills/cccc`，并把 Codex 的规范用户级位置迁移到 `.agents`。
 
-1. Resolve and record the current link or directory targets.
-2. Create the stable v2 checkout without changing the current installation.
-3. Create new temporary links/Junctions pointing to `<checkout>/skills/cccc`.
-4. Run the validator and wrapper usage checks through those temporary paths.
-5. Rename the old entries as backups, then move the verified entries into the canonical paths.
+1. 解析并记录当前链接或目录的真实目标。
+2. 创建稳定的 v2 checkout，不改动当前安装。
+3. 创建指向 `<checkout>/skills/cccc` 的临时链接或 Junction。
+4. 通过临时路径运行 validator 与 wrapper 用法检查。
+5. 把旧入口重命名为备份，再将验证通过的新入口切换到规范路径。
 
-`~/.codex/skills/cccc` is legacy only. Keep it until `~/.agents/skills/cccc` is verified, then remove only that exact old link or copy. Never recursively remove a broad skills directory or an unresolved link target.
+`~/.codex/skills/cccc` 只属于旧版路径。先保留它，等 `~/.agents/skills/cccc` 验证通过后，再只删除这一条明确的旧链接或副本。不要递归删除宽泛的 skills 目录，也不要删除尚未解析真实目标的链接。
 
-Skill changes are normally detected automatically. If the canonical files validate but `$cccc` is still absent, restart the affected host as a fallback, not as a mandatory update step.
+skill 变更通常会被自动发现。如果规范文件验证通过但 `$cccc` 仍未出现，可以重启对应宿主；重启仅作为兜底，不是每次更新的必需步骤。
 
-## Update, rollback, and uninstall
+## 更新、回滚与卸载
 
-Do not update the live checkout in place. Build and validate an independent candidate first; the current links and checkout remain the rollback:
+不要原地更新正在使用的 checkout。先创建独立、带版本号的 candidate，完成验证后再切换；当前链接与 checkout 始终作为回滚基础：
 
 ```bash
 set -eu
@@ -134,40 +153,40 @@ mv "$claude_next" "$claude_live"
 trap - EXIT HUP INT TERM
 ```
 
-The versioned names make later updates independent of earlier candidates and backups. If validation fails, fail-fast handling keeps the live links unchanged and preserves the candidate. If clone, staging, or a switch fails, it keeps or restores the live links, removes only this run's staged links, and preserves the candidate plus any `.failed` link for diagnosis.
+带版本号的名称让后续更新不依赖上一轮 candidate 或备份。如果验证失败，fail-fast 会让 live 链接保持不变，并保留 candidate。如果克隆、暂存链接或切换失败，流程会保留或恢复 live 链接，只移除本轮创建的暂存链接，并保留 candidate 与可能存在的 `.failed` 链接供排查。
 
-To rollback after the switch, rename each live link to `.failed` and move its corresponding `.rollback` link back to the canonical name. The old checkout and failed candidate remain available for inspection. Windows follows the same candidate-first sequence with two staged Junctions and `Rename-Item`; never update the target behind live Junctions before validation.
+切换后需要回滚时，把每个 live 链接重命名为 `.failed`，再将对应的 `.rollback` 链接移回规范名称。旧 checkout 与失败的 candidate 都应保留以供检查。Windows 采用相同的 candidate-first 顺序，通过两个暂存 Junction 与 `Rename-Item` 完成切换；验证前不要修改 live Junction 背后的目标。
 
-Do not delete task cards, discussion cards, reports, opinions, logs, or any project repository.
+不要删除任务卡、讨论卡、报告、意见、日志或任何项目仓库。
 
-For uninstall, first resolve each path and confirm it is the cccc link/Junction or copied skill directory. Remove only `~/.agents/skills/cccc` and `~/.claude/skills/cccc` (plus the exact legacy path if present). Keep or archive the neutral checkout and preserve all project data by default.
+卸载前，先解析每个路径并确认它确实是 cccc 的链接、Junction 或复制目录。只移除 `~/.agents/skills/cccc` 与 `~/.claude/skills/cccc`，必要时再移除已经确认的旧版路径。默认保留或归档中立 checkout，并保留所有项目数据；不要删除更上层的 skills 目录。
 
-## Minimal use
+## 最小用法
 
-Create a task card from [`task-card.md`](skills/cccc/assets/task-card.md), then delegate to the other installed CLI:
+从 [`task-card.md`](skills/cccc/assets/task-card.md) 创建任务卡，然后把受限实现交给另一端 CLI：
 
 ```bash
 bash /absolute/path/to/skills/cccc/scripts/delegate.sh \
   <claude|codex> docs/tasks/T-001.md
 ```
 
-Create a discussion card from [`discussion-card.md`](skills/cccc/assets/discussion-card.md), then request a second opinion:
+从 [`discussion-card.md`](skills/cccc/assets/discussion-card.md) 创建讨论卡，然后向另一端请求独立意见：
 
 ```bash
 bash /absolute/path/to/skills/cccc/scripts/consult.sh \
   <claude|codex> docs/discussions/D-001.md
 ```
 
-Use the target that is not the current orchestrator. Review every result yourself; a consult opinion is advisory and does not authorize code changes.
+这里的 `<claude|codex>` 是供审计和排障使用的显式底层目标：上层 skill 已根据当前宿主选择另一端，wrapper 调用时把该 peer 明确传入。
 
-## Canonical documentation
+## 规范文档
 
-- [Skill router and authorization](skills/cccc/SKILL.md)
-- [Delegate workflow](skills/cccc/references/delegate.md)
-- [Consult workflow](skills/cccc/references/consult.md)
-- [Setup and authentication](skills/cccc/references/setup.md)
-- [Troubleshooting](skills/cccc/references/troubleshooting.md)
+- [Skill 路由与授权](skills/cccc/SKILL.md)
+- [`delegate` 工作流](skills/cccc/references/delegate.md)
+- [`consult` 工作流](skills/cccc/references/consult.md)
+- [安装与认证](skills/cccc/references/setup.md)
+- [故障排查](skills/cccc/references/troubleshooting.md)
 
-## License
+## 许可证
 
 [MIT](LICENSE)

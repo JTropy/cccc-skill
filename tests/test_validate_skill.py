@@ -265,6 +265,25 @@ class ValidateSkillTests(unittest.TestCase):
             suite = (REPOSITORY_ROOT / "tests" / shell_suite).read_text(encoding="utf-8")
             self.assertIn("CCCC_REQUIRE_WINDOWS_NATIVE", suite)
 
+    def test_readme_presents_chinese_bidirectional_collaboration(self) -> None:
+        readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertTrue(readme.startswith("# cccc — Claude Code Codex Collaboration\n"))
+        for required in (
+            "Claude Code 与 Codex 协作",
+            "通用 skill",
+            "自动识别当前宿主",
+            "Claude Code",
+            "Codex",
+            "$imagegen",
+            "Fable 5",
+            "当前 CLI、账号、供应商与工作区",
+        ):
+            self.assertIn(required, readme)
+        self.assertRegex(readme, r"Claude Code[\s\S]{0,220}\$imagegen")
+        self.assertRegex(readme, r"Codex[\s\S]{0,220}Fable 5")
+        self.assertIn("不是操作系统沙箱", readme)
+        self.assertIn("退出码 `0`", readme)
+
     def test_readme_uses_canonical_install_and_safe_migration(self) -> None:
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         lower = readme.lower()
@@ -274,23 +293,24 @@ class ValidateSkillTests(unittest.TestCase):
             "~/.claude/skills/cccc",
             "junction",
             "rollback",
-            "uninstall",
-            "restart",
-            "fallback",
+            "卸载",
+            "重启",
+            "兜底",
         ):
             self.assertIn(required, lower)
-        self.assertRegex(lower, r"~/.codex/skills/cccc[\s\S]{0,120}legacy")
+        self.assertRegex(lower, r"~/.codex/skills/cccc[\s\S]{0,160}旧版")
         self.assertIn("git clone", lower)
         self.assertGreaterEqual(lower.count("new-item -itemtype junction"), 2)
-        self.assertRegex(lower, r"restart[\s\S]{0,120}fallback|fallback[\s\S]{0,120}restart")
-        self.assertRegex(lower, r"uninstall[\s\S]{0,500}(?:keep|preserve|do not delete)")
-        update = lower.split("## update, rollback, and uninstall", 1)[1]
+        self.assertRegex(lower, r"重启[\s\S]{0,160}兜底|兜底[\s\S]{0,160}重启")
+        self.assertRegex(lower, r"卸载[\s\S]{0,600}(?:保留|不要删除)")
+        self.assertIn("## 更新、回滚与卸载", lower)
+        update = lower.split("## 更新、回滚与卸载", 1)[1]
         self.assertNotIn("pull --ff-only", update)
         self.assertIn("candidate", update)
         self.assertIn("readlink", update)
         self.assertIn(".rollback", update)
-        self.assertRegex(update, r"candidate[\s\S]+validate[\s\S]+switch")
-        self.assertRegex(update, r"validation fails[\s\S]+(?:keep|preserve)")
+        self.assertRegex(update, r"candidate[\s\S]+验证[\s\S]+切换")
+        self.assertRegex(update, r"验证失败[\s\S]+(?:保留|不变)")
         update_script = update.split("```bash", 1)[1].split("```", 1)[0]
         self.assertIn("set -eu", update_script)
         self.assertLess(update_script.index("set -eu"), update_script.index("validate_skill.py"))
@@ -317,7 +337,8 @@ class ValidateSkillTests(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "requires POSIX symlink semantics")
     def test_readme_update_recovers_signal_after_completed_link_move(self) -> None:
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
-        update = readme.split("## Update, rollback, and uninstall", 1)[1]
+        self.assertIn("## 更新、回滚与卸载", readme)
+        update = readme.split("## 更新、回滚与卸载", 1)[1]
         script = update.split("```bash", 1)[1].split("```", 1)[0]
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
